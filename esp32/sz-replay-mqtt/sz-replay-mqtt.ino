@@ -37,7 +37,7 @@
 
 // --- Identité ---
 static const char* app_name = "SZ Replay MQTT";
-static const char* version  = "0.2.0";
+static const char* version  = "0.3.0";
 
 // --- WiFi/MQTT ---
 WiFiMulti wifiMulti;
@@ -62,8 +62,18 @@ static const uint32_t REPLAY_PERIOD_MS = 500;
 WiFiClient espClient;
 PubSubClient mqtt(espClient);
 
+// --- FSM States (Machine à États) ---
+enum SystemState { 
+  BOOT,           // Initialisation
+  CONNECT_WIFI,   // Connexion WiFi en cours
+  CONNECT_MQTT,   // Connexion MQTT en cours
+  INIT_REPLAY,    // Initialisation du replay
+  READ_DATA       // Lecture et publication des données
+};
+static SystemState currentState = BOOT;
+
 enum ReplayMode { MODE_NONE, MODE_SYNC_OCR, MODE_TRAMES_RAW };
-static ReplayMode mode = MODE_NONE;
+static ReplayMode replayMode = MODE_NONE;
 
 static File replayFile;
 static uint32_t lastPublishMs = 0;
@@ -237,7 +247,7 @@ static bool parseTramesAndPublishChunk(File& f) {
 static void openReplayFile() {
 #ifdef USE_EMBEDDED_DATA
   // Mode embarqué: utilise les données compilées
-  mode = MODE_SYNC_OCR;
+  replayMode = MODE_SYNC_OCR;
   embeddedLineIdx = 0;
   Serial.printf("[REPLAY] Mode SYNC_OCR (EMBEDDED): %d lignes\n", embeddedLineCount);
   if (mqtt.connected()) mqtt.publish(topic_status, "Replay mode: SYNC_OCR (embedded)");
@@ -245,20 +255,20 @@ static void openReplayFile() {
 #else
   // Mode SPIFFS: lit depuis le filesystem
   if (SPIFFS.exists(PATH_SYNC_OCR)) {
-    mode = MODE_SYNC_OCR;
+    replayMode = MODE_SYNC_OCR;
     replayFile = SPIFFS.open(PATH_SYNC_OCR, "r");
     Serial.printf("[REPLAY] Mode SYNC_OCR: %s\n", PATH_SYNC_OCR);
     mqtt.publish(topic_status, "Replay mode: SYNC_OCR");
     return;
   }
   if (SPIFFS.exists(PATH_TRAMES)) {
-    mode = MODE_TRAMES_RAW;
+    replayMode = MODE_TRAMES_RAW;
     replayFile = SPIFFS.open(PATH_TRAMES, "r");
     Serial.printf("[REPLAY] Mode TRAMES_RAW: %s\n", PATH_TRAMES);
     mqtt.publish(topic_status, "Replay mode: TRAMES_RAW");
     return;
   }
-  mode = MODE_NONE;
+  replayMode = MODE_NONE;
   Serial.println("[REPLAY] Aucun fichier trouvé dans SPIFFS.");
   mqtt.publish(topic_status, "Replay mode: NONE (missing files)");
 #endif
@@ -297,88 +307,143 @@ void setup() {
 }
 
 void loop() {
+  // Maintenance WiFi Multi
   wifiTick();
   
-  // Logs de diagnostic WiFi/MQTT
-  static uint32_t lastDiagMs = 0;
-  if (millis() - lastDiagMs > 5000) {
-    lastDiagMs = millis();
-    Serial.printf("[DIAG] WiFi: %s, MQTT: %s, Mode: %d\n", 
-                  WiFi.status() == WL_CONNECTED ? "OK" : "KO",
-                  mqtt.connected() ? "OK" : "KO",
-                  mode);
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.printf("[DIAG] SSID: %s, IP: %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
-    }
-  }
-  
+  // Maintenance MQTT si WiFi connecté
   if (WiFi.status() == WL_CONNECTED) {
-    if (!mqtt.connected()) {
-      Serial.println("[MQTT] Tentative de connexion...");
-      if (mqttEnsureConnected()) {
-        Serial.println("[MQTT] Connecté !");
-        mqtt.publish(topic_status, "WiFi OK, MQTT OK (replay)");
-      } else {
-        Serial.println("[MQTT] Échec connexion");
-      }
-    }
     mqtt.loop();
   }
 
-  if (mode == MODE_NONE) {
-    // En mode embarqué, on peut démarrer même sans WiFi (pour debug)
+  // MACHINE A ETATS (FSM)
+  switch (currentState) {
+    case BOOT:
+      // Initialisation terminée, passage à la connexion WiFi
+      currentState = CONNECT_WIFI;
+      Serial.println("[FSM] État: CONNECT_WIFI");
+      break;
+
+    case CONNECT_WIFI:
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("[FSM] WiFi connecté: %s (%s)\n", 
+                      WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+        currentState = CONNECT_MQTT;
+        Serial.println("[FSM] État: CONNECT_MQTT");
+      }
+      break;
+
+    case CONNECT_MQTT:
+      if (mqtt.connected()) {
+        Serial.println("[FSM] MQTT connecté");
+        currentState = INIT_REPLAY;
+        Serial.println("[FSM] État: INIT_REPLAY");
+      } else {
+        // Tentative de connexion MQTT
+        if (mqttEnsureConnected()) {
+          Serial.println("[FSM] MQTT connecté");
+          mqtt.publish(topic_status, "WiFi OK, MQTT OK (replay)");
+          currentState = INIT_REPLAY;
+          Serial.println("[FSM] État: INIT_REPLAY");
+        }
+      }
+      break;
+
+    case INIT_REPLAY:
+      // Initialise le replay (embarqué ou SPIFFS)
 #ifdef USE_EMBEDDED_DATA
-    openReplayFile();
+      openReplayFile();
+      if (replayMode != MODE_NONE) {
+        currentState = READ_DATA;
+        Serial.println("[FSM] État: READ_DATA");
+      }
 #else
-    if (WiFi.status() == WL_CONNECTED && mqtt.connected()) {
       if (SPIFFS.begin(true)) {
         openReplayFile();
+        if (replayMode != MODE_NONE) {
+          currentState = READ_DATA;
+          Serial.println("[FSM] État: READ_DATA");
+        } else {
+          // Pas de fichier trouvé, on reste en INIT_REPLAY
+          delay(1000);
+        }
       }
-    }
 #endif
-    delay(200);
-    return;
-  }
+      break;
+
+    case READ_DATA:
+      // Vérifie que les connexions sont toujours actives
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[FSM] WiFi perdu, retour à CONNECT_WIFI");
+        currentState = CONNECT_WIFI;
+        break;
+      }
+      if (!mqtt.connected()) {
+        Serial.println("[FSM] MQTT perdu, retour à CONNECT_MQTT");
+        currentState = CONNECT_MQTT;
+        break;
+      }
+
+      // Vérifie le mode de replay
+      if (replayMode == MODE_NONE) {
+        currentState = INIT_REPLAY;
+        break;
+      }
 
 #ifndef USE_EMBEDDED_DATA
-  if (!replayFile) {
-    // fin de fichier ou erreur: on repart au début
-    openReplayFile();
-    delay(200);
-    return;
-  }
+      // En mode SPIFFS, vérifie que le fichier est ouvert
+      if (!replayFile) {
+        openReplayFile();
+        if (replayMode == MODE_NONE) {
+          currentState = INIT_REPLAY;
+        }
+        break;
+      }
 #endif
 
-  if (millis() - lastPublishMs < REPLAY_PERIOD_MS) return;
-  lastPublishMs = millis();
+      // Publication périodique
+      if (millis() - lastPublishMs < REPLAY_PERIOD_MS) break;
+      lastPublishMs = millis();
 
-  if (mode == MODE_SYNC_OCR) {
-    String line;
+      if (replayMode == MODE_SYNC_OCR) {
+        String line;
 #ifdef USE_EMBEDDED_DATA
-    // Mode embarqué: lit depuis le tableau PROGMEM
-    if (embeddedLineIdx >= embeddedLineCount) {
-      embeddedLineIdx = 0; // reboucle
-    }
-    line = String(sz_data_lines[embeddedLineIdx]);
-    embeddedLineIdx++;
+        // Mode embarqué: lit depuis le tableau
+        if (embeddedLineIdx >= embeddedLineCount) {
+          embeddedLineIdx = 0; // reboucle
+        }
+        line = String(sz_data_lines[embeddedLineIdx]);
+        embeddedLineIdx++;
 #else
-    // Mode SPIFFS: lit depuis le fichier
-    if (!readLine(replayFile, line)) {
-      replayFile.close();
-      openReplayFile();
-      return;
-    }
+        // Mode SPIFFS: lit depuis le fichier
+        if (!readLine(replayFile, line)) {
+          replayFile.close();
+          openReplayFile();
+          break;
+        }
 #endif
-    if (!replaySyncOcrLine(line)) {
-      // si ligne illisible, on saute
-      return;
-    }
-  } else if (mode == MODE_TRAMES_RAW) {
-    if (!parseTramesAndPublishChunk(replayFile)) {
-      replayFile.close();
-      openReplayFile();
-      return;
-    }
+        if (!replaySyncOcrLine(line)) {
+          // si ligne illisible, on saute
+          break;
+        }
+      } else if (replayMode == MODE_TRAMES_RAW) {
+        if (!parseTramesAndPublishChunk(replayFile)) {
+          replayFile.close();
+          openReplayFile();
+          break;
+        }
+      }
+      break;
+  }
+
+  // Logs de diagnostic périodiques
+  static uint32_t lastDiagMs = 0;
+  if (millis() - lastDiagMs > 5000) {
+    lastDiagMs = millis();
+    Serial.printf("[DIAG] État: %d, WiFi: %s, MQTT: %s, Replay: %d\n", 
+                  currentState,
+                  WiFi.status() == WL_CONNECTED ? "OK" : "KO",
+                  mqtt.connected() ? "OK" : "KO",
+                  replayMode);
   }
 }
 
