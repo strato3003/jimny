@@ -3,6 +3,12 @@
 ## 1. Identité du Projet
 - Nom de l'application : "OBD2CLOUD" (doit apparaître tel quel dans l'interface).
 - Version : Toujours inclure le numéro de version dans le titre principal.
+- **Semantic Versioning** : Utiliser le format MAJOR.MINOR.PATCH (ex: 1.2.3)
+  - **MAJOR** : Changements incompatibles avec les versions précédentes
+  - **MINOR** : Nouvelles fonctionnalités rétrocompatibles
+  - **PATCH** : Corrections de bugs rétrocompatibles
+  - **Incrémentation automatique** : Incrémenter automatiquement le PATCH pour les corrections de bugs
+  - **Incrémentation manuelle** : Demander avant d'incrémenter MAJOR ou MINOR
 - Section "About" : Regrouper ici les informations détaillées, crédits et licences. (le detail sera un résumé automatique du but général et des principales features, le crédit issu du fichier du meme nom)
 
 ## 2. Règles de Développement (Anti-Casse)
@@ -12,6 +18,7 @@
 - **Approche Incrémentale :** Ne réécris jamais un fichier entier si une modification locale suffit. Utilise des "diffs" chirurgicaux.
 - **Persistance :** Ne supprime jamais de commentaires explicatifs ou de constantes de configuration sans demander.
 - **Mémoire du Contexte :** Avant chaque modification majeure, vérifie la cohérence avec les fonctionnalités de leçon/entraînement existantes.
+- **Nouvelles features :** A chaque demandes d'ameliorations/features au prompt, les mentionner en features afin de pouvoir les resumer sur un suivi de version
 
 ## 3. Style et Langue
 - **Langue :** Le code peut être en anglais (standard), mais les commentaires techniques et l'interface utilisateur doivent être en **Français**.

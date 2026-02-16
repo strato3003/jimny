@@ -1,4 +1,15 @@
 # OBD2 in cloud
+
+> **Note** : Pour le suivi détaillé des features et améliorations, voir [FEATURES.md](FEATURES.md)
+
+## Contexte véhicule
+
+- **Adaptateur**: vLinker (OBD2 Bluetooth)
+- **Véhicule**: Suzuki Jimny DDIS 1.5 (2008)
+- **Moteur**: Renault K9K (diesel)
+- **Protocole**: KWP2000 (Keyword Protocol 2000) - PIDs propriétaires
+- **PIDs utilisés**: 21A0, 21A2, 21A5, 21CD (PIDs étendus/propriétaires)
+
 ## prompts agent
 ```
 proposes moi un code pour esp32 en t'inspirant de @esp32/vlinker-gw.ino , capable d'envoyer une sequence json sur mqtt qui reprend l'ensemble des 20 donnees affichees sur la fenetre en noir du programme "SZ Viewer" montré sur cette image attachee et qui proviennent du dialogue entamé entre le SZ Viewer et le vLinker (boitier OBD en Bluetooth) et capturé en MIM via un prog python.
@@ -29,7 +40,61 @@ python3 tools/sz_sync.py --anchor-hhmmss 17:36:53 --fps 2
 
 Remplir progressivement `values` (manuellement ou via OCR) puis en déduire les offsets/échelles à implémenter dans `esp32/sz-mqtt.ino` (`decodeSzFromPages()`).
 
-## Simulation “au chaud” (sans BLE) : replay MQTT
+## Système de LEDs expressif
+
+Le sketch `esp32/sz-mqtt/sz-mqtt.ino` utilise **une seule LED** (orange, pin 21) sur le XIAO ESP32S3 SENSE pour indiquer l'état du système de manière expressive :
+
+### Principe
+- **Garantie visuelle** : La LED est toujours allumée (fixe ou clignotante, fréquence min 1s) si l'ESP est sous tension
+- **Patterns variables** : Fréquences (100ms à 2000ms) et duty cycles (0-100%) selon l'état
+- **LED orange unique** : Affiche les états combinés WiFi/MQTT et BLE/OBD via des patterns intelligents
+- **NOTE** : Le XIAO ESP32S3 SENSE n'a qu'une seule LED accessible (orange). Les patterns WiFi et BLE sont combinés sur cette LED unique.
+
+### LED orange (unique) - Patterns combinés WiFi/MQTT + BLE/OBD
+
+La LED orange affiche les états combinés selon la logique suivante :
+
+| Situation | Pattern affiché | Signification |
+|-----------|----------------|---------------|
+| **WiFi + BLE actifs** | Pattern le plus rapide (priorité activité) | Les deux systèmes fonctionnent |
+| **Seulement WiFi actif** | Pattern WiFi | WiFi/MQTT connecté, BLE inactif |
+| **Seulement BLE actif** | Pattern BLE | BLE/OBD connecté, WiFi inactif |
+| **Aucun actif** | Pattern de secours (1s, 50%) | Système en attente |
+
+#### États WiFi/MQTT (quand actif seul ou combiné)
+
+| État | Pattern | Signification |
+|------|---------|---------------|
+| **BOOT** | Clignotement lent 1s (50% duty) | Démarrage de l'ESP |
+| **CONNECT_WIFI** | Clignotement moyen 500ms (30% duty) | Connexion WiFi en cours |
+| **CONNECT_MQTT** | Clignotement rapide 250ms (50% duty) | Connexion MQTT en cours |
+| **WiFi + MQTT OK** | Fixe allumé (100% duty) | Tout est connecté |
+| **WiFi OK / MQTT KO** | Clignotement lent 1s (70% duty) | WiFi OK mais MQTT déconnecté |
+| **WiFi KO** | Clignotement très lent 2s (20% duty) | WiFi déconnecté |
+
+#### États BLE/OBD (quand actif seul ou combiné)
+
+| État | Pattern | Signification |
+|------|---------|---------------|
+| **BOOT/WiFi/MQTT** | Éteint | Pas encore en mode BLE |
+| **CONNECT_BLE** | Clignotement moyen 500ms (50% duty) | Scan/connexion BLE en cours |
+| **INIT_ELM** | Clignotement rapide 250ms (50% duty) | Initialisation ELM327 |
+| **POLL_SZ actif** | Clignotement très rapide 100ms (30% duty) | Polling OBD actif |
+| **BLE connecté (stable)** | Fixe allumé (100% duty) | BLE connecté, stable |
+| **BLE déconnecté** | Clignotement lent 1s (20% duty) | BLE déconnecté |
+
+### Légende des patterns
+- **Fixe** : LED allumée en continu
+- **Clignotement très rapide** (100ms) : Activité intense
+- **Clignotement rapide** (250ms) : Activité normale
+- **Clignotement moyen** (500ms) : Connexion en cours
+- **Clignotement lent** (1000ms) : État d'attente
+- **Clignotement très lent** (2000ms) : Problème/erreur
+- **Duty cycle faible** (20-30%) : État problématique ou activité minimale
+- **Duty cycle moyen** (50%) : État normal
+- **Duty cycle élevé** (70-100%) : État optimal
+
+## Simulation "au chaud" (sans BLE) : replay MQTT
 
 Le sketch `esp32/sz-replay-mqtt/sz-replay-mqtt.ino` permet de simuler la gateway en publiant des JSON sur MQTT.
 
