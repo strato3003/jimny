@@ -1,0 +1,22 @@
+# Instructions spécifiques pour OBD2CLOUD
+
+## 1. Identité du Projet
+- Nom de l'application : "OBD2CLOUD" (doit apparaître tel quel dans l'interface).
+- Version : Toujours inclure le numéro de version dans le titre principal.
+- Section "About" : Regrouper ici les informations détaillées, crédits et licences. (le detail sera un résumé automatique du but général et des principales features, le crédit issu du fichier du meme nom)
+
+## 2. Règles de Développement (Anti-Casse)
+- **Machine a etats (FSM) :** utiliser cette technique pour gerer efficacement les etats de connectivité Wifi et BLE afin d'en assurer un maintien optimal.
+- **approche modulaire integrant un mode pilotage par API :** Coder sous forme de modules bien séparés.
+- **Maintien des features :** Conserver et verifier que toutes les features sont bien conservées après chaque itération.
+- **Approche Incrémentale :** Ne réécris jamais un fichier entier si une modification locale suffit. Utilise des "diffs" chirurgicaux.
+- **Persistance :** Ne supprime jamais de commentaires explicatifs ou de constantes de configuration sans demander.
+- **Mémoire du Contexte :** Avant chaque modification majeure, vérifie la cohérence avec les fonctionnalités de leçon/entraînement existantes.
+
+## 3. Style et Langue
+- **Langue :** Le code peut être en anglais (standard), mais les commentaires techniques et l'interface utilisateur doivent être en **Français**.
+- **UI/UX :** Favoriser une interface claire, réactive et adaptée à l'apprentissage (accessibilité).
+
+## 4. Workflow de Validation
+- Avant de coder, propose un plan d'action en 3 points maximum.
+- Si une modification risque d'impacter une autre partie du code, alerte l'utilisateur avant d'appliquer les changements.

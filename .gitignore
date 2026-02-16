@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# Fichiers générés automatiquement
+esp32/sz-replay-mqtt/sz_data.h
+medias/frames/
+medias/ocr/
+
+# Fichiers de log volumineux (optionnel, à garder si besoin)
+# medias/trames.log
+# medias/sz_sync.jsonl
+# medias/sz_sync_ocr.jsonl
