@@ -1,3 +1,12 @@
+// NOTE Arduino (pré-processeur .ino):
+// Arduino génère automatiquement des prototypes de fonctions en haut du fichier.
+// Si un prototype mentionne un type défini plus bas (ex: LedPattern), la compilation échoue.
+// → On déclare LedPattern AVANT les #include pour être visible dans les prototypes auto-générés.
+struct LedPattern {
+  unsigned long period_ms;     // 0 = fixe, >0 = clignotant
+  unsigned char duty_cycle;    // 0-100 (% de temps ON)
+};
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiMulti.h>
@@ -14,32 +23,13 @@
 #include <BLERemoteService.h>
 #include <BLERemoteCharacteristic.h>
 #include <ArduinoJson.h>
+#include "sz_decode.h"
+#include "obd2_decode.h"
 
-// --- Structure de données SZ Viewer (déclarée tôt pour visibilité) ---
-struct SzData {
-  // 20 champs (noms calqués sur l'écran SZ Viewer)
-  float desired_idle_speed_rpm = NAN;
-  float accelerator_pct = NAN;
-  float intake_c = NAN;
-  float battery_v = NAN;
-  float fuel_temp_c = NAN;
-  float bar_pressure_kpa = NAN;
-  float bar_pressure_mmhg = NAN;
-  float abs_pressure_mbar = NAN;
-  float air_flow_estimate_mgcp = NAN;
-  float air_flow_request_mgcp = NAN;
-
-  float speed_kmh = NAN;
-  float rail_pressure_bar = NAN;
-  float rail_pressure_control_bar = NAN;
-  float desired_egr_position_pct = NAN;
-  float gear_ratio = NAN;
-  float egr_position_pct = NAN;
-  float engine_temp_c = NAN;
-  float air_temp_c = NAN;
-  float requested_in_pressure_mbar = NAN;
-  float engine_rpm = NAN;
-};
+// 1 = protocole OBD2 (PIDs mode 01, comme Car Scanner) ; 0 = pages KWP SZ (21A0/21A2/21A5/21CD)
+#ifndef USE_OBD2_PROTOCOL
+#define USE_OBD2_PROTOCOL 1
+#endif
 
 // ============================================================
 //  ESP32 → vLinker (BLE) → Requêtes type SZ Viewer → MQTT JSON
@@ -62,7 +52,7 @@ struct SzData {
 
 // --- Configuration (WiFi/MQTT/BLE) ---
 static const char* app_name = "SZ→MQTT Gateway";
-static const char* version  = "0.4.4";
+static const char* version  = "0.4.13";
 
 WiFiMulti wifiMulti;
 static const char* mqtt_server = "srv.lpb.ovh";
@@ -86,6 +76,8 @@ static const char* topic_debug  = "jimny/szviewer/raw";
 static const char* topic_dtc    = "jimny/dtc";
 
 // --- FSM States ---
+// Priorité: 1) Internet (WiFi + NTP) pour traces horodatées, 2) MQTT, 3) BLE.
+// Si le WiFi tombe en CONNECT_BLE/INIT_ELM/POLL_SZ → retour CONNECT_WIFI pour le rétablir.
 enum SystemState {
   BOOT,
   CONNECT_WIFI,
@@ -108,6 +100,24 @@ static SystemState currentState = BOOT;
 // La LED rouge n'est pas accessible en GPIO sur cette board
 #define USE_SINGLE_LED true       // Utiliser une seule LED pour WiFi et BLE
 
+// Certaines boards ont une LED "active low" (LOW=ON, HIGH=OFF).
+// XIAO ESP32S3: LED user souvent active-low.
+#ifndef LED_WIFI_ACTIVE_LOW
+  #if defined(ARDUINO_XIAO_ESP32S3) || defined(ARDUINO_SEEED_XIAO_ESP32S3) || defined(ARDUINO_SEEED_XIAO_ESP32S3_SENSE)
+    #define LED_WIFI_ACTIVE_LOW 1
+  #else
+    #define LED_WIFI_ACTIVE_LOW 1
+  #endif
+#endif
+
+static inline void ledWifiWrite(bool on) {
+#if LED_WIFI_ACTIVE_LOW
+  digitalWrite(LED_WIFI_PIN, on ? LOW : HIGH);
+#else
+  digitalWrite(LED_WIFI_PIN, on ? HIGH : LOW);
+#endif
+}
+
 // Système de LEDs expressif
 // Au moins une LED doit être allumée (fixe ou clignotante min 1s) si l'ESP est sous tension
 // Fréquences: 1000ms (lent), 500ms (moyen), 250ms (rapide), 100ms (très rapide)
@@ -116,75 +126,130 @@ static uint32_t ledBleLastToggle = 0;
 static bool ledWifiState = false;
 static bool ledBleState = false;
 
-// Patterns LED: période en ms (0 = fixe), duty cycle (0-100)
-struct LedPattern {
-  uint32_t period_ms;  // 0 = fixe, >0 = clignotant
-  uint8_t duty_cycle;  // 0-100 (% de temps ON)
-};
+// Activité (overlay) — une impulsion visuelle à chaque échange BLE/ELM et chaque envoi MQTT.
+// Une seule LED sur XIAO ESP32S3 SENSE, donc on encode l'activité par des "bursts" courts.
+static volatile uint32_t ledBleActivityMs = 0;
+static volatile uint32_t ledMqttActivityMs = 0;
 
-// LED WiFi (orange): États WiFi/MQTT
-static LedPattern getWifiPattern(SystemState state, bool wifiOk, bool mqttOk) {
-  LedPattern p = {0, 100};
-  
-  if (state == BOOT) {
-    // Boot: clignotement lent 1s (50% duty)
-    p.period_ms = 1000;
-    p.duty_cycle = 50;
-  } else if (state == CONNECT_WIFI) {
-    // Connexion WiFi: clignotement moyen 500ms (30% duty - faible)
-    p.period_ms = 500;
-    p.duty_cycle = 30;
-  } else if (state == CONNECT_MQTT) {
-    // Connexion MQTT: clignotement rapide 250ms (50% duty)
-    p.period_ms = 250;
-    p.duty_cycle = 50;
-  } else if (wifiOk && mqttOk) {
-    // WiFi + MQTT OK: fixe allumé
-    p.period_ms = 0;
-    p.duty_cycle = 100;
-  } else if (wifiOk && !mqttOk) {
-    // WiFi OK mais MQTT KO: clignotement lent 1s (70% duty)
-    p.period_ms = 1000;
-    p.duty_cycle = 70;
-  } else {
-    // WiFi KO: clignotement très lent 2s (20% duty - très faible)
-    p.period_ms = 2000;
-    p.duty_cycle = 20;
+// Marqueur "étape" (lié aux logs stdout): reset de phase + pattern distinct
+static volatile uint32_t ledStepAtMs = 0;
+static volatile uint32_t ledStepId = 0;
+
+static inline void ledNoteBleActivity() { ledBleActivityMs = millis(); }
+static inline void ledNoteMqttActivity() { ledMqttActivityMs = millis(); }
+
+static inline void ledMarkStep() {
+  uint32_t now = millis();
+  ledStepAtMs = now;
+  ledStepId++;
+  // reset de phase pour que le changement d'étape soit visible immédiatement
+  ledWifiLastToggle = now;
+  ledBleLastToggle = now;
+}
+
+// Log + changement de pattern LED (chaque ligne stdout = step visible)
+#define STEPLN(...) do { Serial.println(__VA_ARGS__); ledMarkStep(); } while(0)
+#define STEPF(...)  do { Serial.printf(__VA_ARGS__); ledMarkStep(); } while(0)
+
+// --- Morse méthode Koch (trains de clignotement = lettre en Morse) ---
+// Ordre Koch classique: 1er train = K, 2e = M, 3e = R, etc. (. = dit, - = dah)
+static const char* const kochMorse[] = {
+  "-.-",   /* K */  "--",    /* M */  ".-.",   /* R */  "...",   /* S */  "..-",   /* U */
+  ".-",    /* A */  ".--.",  /* P */  "-",     /* T */  ".",     /* E */  "-.",    /* N */
+  "..",    /* I */  "---",   /* O */  "--.",   /* G */  "--.-",  /* Q */  "--..",  /* Z */
+  "-.--",  /* Y */  "-.-.",  /* C */  "-..-",  /* X */  "-...",  /* B */  ".---",  /* J */
+  ".-..",  /* L */  "..-.",  /* F */  "....", /* H */  "...-",  /* V */  "-..",   /* D */
+  ".--"    /* W */
+};
+static const int kochCount = sizeof(kochMorse) / sizeof(kochMorse[0]);
+
+// Retourne true si la LED doit être ON pour le Morse Koch (état mis à jour en interne).
+static bool ledMorseKochShouldBeOn(uint32_t now) {
+  const uint32_t unit_ms = 55;  // 1 unité = 55 ms (dit=55, dah=165, espace lettre=165)
+  static int letterIndex = -1;
+  static int symbolIndex = 0;
+  static int subPhase = 0;      // 0=ON (dit/dah), 1=OFF (gap sym), 2=OFF (gap lettre)
+  static uint32_t phaseStartMs = 0;
+
+  int stepLetter = (int)((uint32_t)ledStepId % (uint32_t)kochCount);
+  if (letterIndex != stepLetter || phaseStartMs == 0) {
+    letterIndex = stepLetter;
+    symbolIndex = 0;
+    subPhase = 0;
+    phaseStartMs = now;
   }
-  
+
+  const char* m = kochMorse[letterIndex];
+  int len = (int)strlen(m);
+  uint32_t duration = 0;
+  if (subPhase == 0) {
+    duration = (m[symbolIndex] == '-') ? (3 * unit_ms) : (1 * unit_ms);
+  } else if (subPhase == 1) {
+    duration = 1 * unit_ms;
+  } else {
+    duration = 3 * unit_ms;
+  }
+
+  for (int guard = 0; guard < 64 && (uint32_t)(now - phaseStartMs) >= duration; guard++) {
+    phaseStartMs += duration;
+    if (subPhase == 0) {
+      subPhase = 1;
+      duration = 1 * unit_ms;
+    } else if (subPhase == 1) {
+      symbolIndex++;
+      if (symbolIndex >= len) {
+        subPhase = 2;
+        duration = 3 * unit_ms;
+      } else {
+        subPhase = 0;
+        duration = (m[symbolIndex] == '-') ? (3 * unit_ms) : (1 * unit_ms);
+      }
+    } else {
+      symbolIndex = 0;
+      subPhase = 0;
+      duration = (m[symbolIndex] == '-') ? (3 * unit_ms) : (1 * unit_ms);
+    }
+  }
+
+  return (subPhase == 0);
+}
+
+// LED WiFi: heartbeat (jamais fixe ON), vitesse + "intensité" (duty) selon l'état.
+// Contrainte: fréquence >= 0.5 Hz (période <= 2000 ms)
+static LedPattern getWifiPattern(SystemState state, bool wifiOk, bool mqttOk) {
+  LedPattern p = {1000, 35}; // 1 Hz par défaut
+  if (state == BOOT) {
+    p.period_ms = 200; p.duty_cycle = 50;
+  } else if (state == CONNECT_WIFI) {
+    p.period_ms = 300; p.duty_cycle = 20;
+  } else if (state == CONNECT_MQTT) {
+    p.period_ms = 250; p.duty_cycle = 30;
+  } else if (wifiOk && mqttOk) {
+    p.period_ms = 1000; p.duty_cycle = 40;
+  } else if (wifiOk && !mqttOk) {
+    p.period_ms = 500; p.duty_cycle = 25;
+  } else {
+    p.period_ms = 800; p.duty_cycle = 25;
+  }
   return p;
 }
 
-// LED BLE (rouge): États BLE/OBD
+// LED BLE: pas de "fixe ON", juste des pulses (et overlay d'activité par dessus).
 static LedPattern getBlePattern(SystemState state, bool bleOk) {
-  LedPattern p = {0, 100};
-  
+  LedPattern p = {1000, 25};
   if (state == BOOT || state == CONNECT_WIFI || state == CONNECT_MQTT) {
-    // Pas encore en mode BLE: éteint
-    p.period_ms = 0;
-    p.duty_cycle = 0;
+    p.period_ms = 0;   p.duty_cycle = 0;
   } else if (state == CONNECT_BLE) {
-    // Scan/connexion BLE: clignotement moyen 500ms (50% duty)
-    p.period_ms = 500;
-    p.duty_cycle = 50;
+    p.period_ms = 250; p.duty_cycle = 25;
   } else if (state == INIT_ELM) {
-    // Init ELM: clignotement rapide 250ms (50% duty)
-    p.period_ms = 250;
-    p.duty_cycle = 50;
+    p.period_ms = 200; p.duty_cycle = 35;
   } else if (state == POLL_SZ && bleOk) {
-    // Polling actif: clignotement très rapide 100ms (30% duty - faible)
-    p.period_ms = 100;
-    p.duty_cycle = 30;
+    p.period_ms = 500; p.duty_cycle = 20;
   } else if (bleOk) {
-    // BLE connecté mais pas en polling: fixe allumé
-    p.period_ms = 0;
-    p.duty_cycle = 100;
+    p.period_ms = 800; p.duty_cycle = 25;
   } else {
-    // BLE déconnecté: clignotement lent 1s (20% duty - très faible)
-    p.period_ms = 1000;
-    p.duty_cycle = 20;
+    p.period_ms = 400; p.duty_cycle = 20;
   }
-  
   return p;
 }
 
@@ -236,12 +301,12 @@ static int fifoCount = 0; // Nombre de trames dans le buffer
 static void fifoInit() {
   // Obtenir la mémoire libre disponible
   uint32_t freeHeapBefore = ESP.getFreeHeap();
-  Serial.printf("[FIFO] Mémoire libre avant allocation: %u bytes\n", freeHeapBefore);
+  STEPF("[FIFO] Mémoire libre avant allocation: %u bytes\n", freeHeapBefore);
   
   // Réserver seulement 20% de la mémoire libre pour le buffer FIFO
   // (le reste est nécessaire pour WiFi, MQTT, BLE, JSON, etc.)
   uint32_t availableForFifo = (freeHeapBefore * 20) / 100;
-  Serial.printf("[FIFO] Mémoire réservée pour FIFO (20%%): %u bytes\n", availableForFifo);
+  STEPF("[FIFO] Mémoire réservée pour FIFO (20%%): %u bytes\n", availableForFifo);
   
   // Calculer le nombre d'entrées possibles
   int maxEntries = availableForFifo / ESTIMATED_ENTRY_SIZE;
@@ -250,12 +315,12 @@ static void fifoInit() {
   // Pas de limite maximale : utiliser toute la mémoire disponible si nécessaire
   if (maxEntries < 10) {
     maxEntries = 10;
-    Serial.println("[FIFO] Mémoire limitée, utilisation du minimum (10 entrées)");
+    STEPLN("[FIFO] Mémoire limitée, utilisation du minimum (10 entrées)");
   }
   
   // Afficher un avertissement si le buffer est très grand (pour info)
   if (maxEntries > 1000) {
-    Serial.printf("[FIFO] Mémoire abondante: %d entrées allouées (~%u KB)\n", 
+    STEPF("[FIFO] Mémoire abondante: %d entrées allouées (~%u KB)\n", 
                   maxEntries, (maxEntries * ESTIMATED_ENTRY_SIZE) / 1024);
   }
   
@@ -264,7 +329,7 @@ static void fifoInit() {
   // Allouer le buffer
   fifoBuffer = new FifoEntry[FIFO_BUFFER_SIZE];
   if (!fifoBuffer) {
-    Serial.println("[FIFO] ERREUR: Échec d'allocation mémoire !");
+    STEPLN("[FIFO] ERREUR: Échec d'allocation mémoire !");
     FIFO_BUFFER_SIZE = 0;
     return;
   }
@@ -278,21 +343,21 @@ static void fifoInit() {
   uint32_t freeHeapAfter = ESP.getFreeHeap();
   uint32_t memoryUsed = freeHeapBefore - freeHeapAfter;
   
-  Serial.printf("[FIFO] Buffer alloué: %d entrées\n", FIFO_BUFFER_SIZE);
-  Serial.printf("[FIFO] Mémoire utilisée: %u bytes (estimation: ~%u bytes)\n",
+  STEPF("[FIFO] Buffer alloué: %d entrées\n", FIFO_BUFFER_SIZE);
+  STEPF("[FIFO] Mémoire utilisée: %u bytes (estimation: ~%u bytes)\n",
                 memoryUsed, FIFO_BUFFER_SIZE * ESTIMATED_ENTRY_SIZE);
-  Serial.printf("[FIFO] Mémoire libre après allocation: %u bytes\n", freeHeapAfter);
+  STEPF("[FIFO] Mémoire libre après allocation: %u bytes\n", freeHeapAfter);
   
   // Avertissement si la mémoire libre est trop faible pour MQTT
   if (freeHeapAfter < 50000) {
-    Serial.printf("[FIFO] ATTENTION: Mémoire libre faible (%u bytes) - MQTT pourrait avoir des problèmes\n", freeHeapAfter);
+    STEPF("[FIFO] ATTENTION: Mémoire libre faible (%u bytes) - MQTT pourrait avoir des problèmes\n", freeHeapAfter);
   }
 }
 
 // Ajoute une trame au buffer FIFO (retourne false si buffer plein)
 static bool fifoPush(const SzData& d, const String& rawA0, const String& rawA2, const String& rawA5, const String& rawCD) {
   if (fifoCount >= FIFO_BUFFER_SIZE) {
-    Serial.printf("[FIFO] Buffer plein (%d/%d), perte de trame\n", fifoCount, FIFO_BUFFER_SIZE);
+    STEPF("[FIFO] Buffer plein (%d/%d), perte de trame\n", fifoCount, FIFO_BUFFER_SIZE);
     return false;
   }
   
@@ -334,6 +399,7 @@ static bool fifoPop(SzData& d, String& rawA0, String& rawA2, String& rawA5, Stri
 
 static void notifyCallback(BLERemoteCharacteristic* /*c*/, uint8_t* data, size_t len, bool /*isNotify*/) {
   gotNotify = true;
+  ledNoteBleActivity();
   String received;
   for (size_t i = 0; i < len; i++) {
     char c = (char)data[i];
@@ -342,7 +408,7 @@ static void notifyCallback(BLERemoteCharacteristic* /*c*/, uint8_t* data, size_t
   }
   // Log seulement les caractères non-printables ou les réponses importantes
   if (received.indexOf(">") >= 0 || received.indexOf("OK") >= 0 || received.indexOf("ERROR") >= 0) {
-    Serial.printf("[BLE] NOTIFY (%d bytes): %s\n", len, received.c_str());
+    STEPF("[BLE] NOTIFY (%d bytes): %s\n", len, received.c_str());
   }
 }
 
@@ -351,10 +417,10 @@ static bool mqttEnsureConnected() {
   
   // Vérifier la mémoire avant connexion
   uint32_t freeHeap = ESP.getFreeHeap();
-  Serial.printf("[MQTT] Tentative de connexion - mémoire libre: %u bytes\n", freeHeap);
+  STEPF("[MQTT] Tentative de connexion - mémoire libre: %u bytes\n", freeHeap);
   
   if (freeHeap < 20000) {
-    Serial.printf("[MQTT] ATTENTION: Mémoire libre faible (%u bytes) - risque d'échec\n", freeHeap);
+    STEPF("[MQTT] ATTENTION: Mémoire libre faible (%u bytes) - risque d'échec\n", freeHeap);
   }
   
   bool connected = mqtt.connect(mqtt_client_id, mqtt_user, mqtt_pass);
@@ -373,12 +439,13 @@ static bool mqttEnsureConnected() {
     else if (mqttState == 4) stateStr = "CONNECT_BAD_CREDENTIALS";
     else if (mqttState == 5) stateStr = "CONNECT_UNAUTHORIZED";
     
-    Serial.printf("[MQTT] Échec de connexion - état: %d (%s), mémoire libre: %u bytes\n", 
+    STEPF("[MQTT] Échec de connexion - état: %d (%s), mémoire libre: %u bytes\n", 
                   mqttState, stateStr, ESP.getFreeHeap());
-    Serial.printf("[MQTT] Vérifier: WiFi connecté ? (%d), serveur: %s:%d\n",
+    STEPF("[MQTT] Vérifier: WiFi connecté ? (%d), serveur: %s:%d\n",
                   WiFi.status() == WL_CONNECTED, mqtt_server, mqtt_port);
   } else {
-    Serial.printf("[MQTT] Connecté avec succès - mémoire libre: %u bytes\n", ESP.getFreeHeap());
+    STEPF("[MQTT] Connecté avec succès - mémoire libre: %u bytes\n", ESP.getFreeHeap());
+    STEPF("[MQTT] Pour recevoir les messages: abonnez-vous à 'jimny/#' sur %s:%d\n", mqtt_server, mqtt_port);
   }
   
   return connected;
@@ -391,7 +458,7 @@ static void configureNTP() {
   if (WiFi.status() == WL_CONNECTED) {
     configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
     ntpConfigured = true;
-    Serial.println("[NTP] Configuration NTP effectuée");
+    STEPLN("[NTP] Configuration NTP effectuée");
   }
 }
 
@@ -417,7 +484,7 @@ static String getReadableDateTime() {
 static void mqttPublishStatus(const char* message) {
   if (!mqtt.connected()) {
     if (!mqttEnsureConnected()) {
-      Serial.printf("[STATUS] MQTT non connecté, message non publié: %s\n", message);
+      STEPF("[STATUS] MQTT non connecté, message non publié: %s\n", message);
       return;
     }
   }
@@ -459,12 +526,13 @@ static void mqttPublishStatus(const char* message) {
   size_t n = serializeJson(doc, payload, sizeof(payload));
   
   if (mqtt.publish(topic_status, (uint8_t*)payload, n, false)) {
-    Serial.printf("[STATUS] Publié: %s (%s) - WiFi:%s MQTT:%s BLE:%s\n", 
+    STEPF("[STATUS] Publié: %s (%s) - WiFi:%s MQTT:%s BLE:%s\n", 
                   message, getReadableDateTime().c_str(), 
                   wifiStatus.c_str(), mqttStatus.c_str(), bleStatus.c_str());
-    mqtt.loop();
+    ledNoteMqttActivity();
+    for (int i = 0; i < 5; i++) { mqtt.loop(); delay(2); }
   } else {
-    Serial.printf("[STATUS] Échec publication: %s\n", message);
+    STEPF("[STATUS] Échec publication: %s\n", message);
   }
 }
 
@@ -478,11 +546,11 @@ struct WifiNetwork {
 
 // Scanner et lister les 5 meilleurs réseaux WiFi (par RSSI)
 static void wifiScanAndListTop5() {
-  Serial.println("[WiFi] Scan des réseaux disponibles...");
+  STEPLN("[WiFi] Scan des réseaux disponibles...");
   int n = WiFi.scanNetworks();
   
   if (n == 0) {
-    Serial.println("[WiFi] Aucun réseau trouvé");
+    STEPLN("[WiFi] Aucun réseau trouvé");
     return;
   }
   
@@ -508,10 +576,10 @@ static void wifiScanAndListTop5() {
   
   // Afficher les 5 meilleurs
   int topCount = (n < 5) ? n : 5;
-  Serial.printf("[WiFi] Top %d réseau(x) (par RSSI):\n", topCount);
+  STEPF("[WiFi] Top %d réseau(x) (par RSSI):\n", topCount);
   for (int i = 0; i < topCount; i++) {
     const char* encStr = networks[i].isOpen ? "OUVERT" : "protégé";
-    Serial.printf("  %d. %s (RSSI: %d dBm, %s)\n", 
+    STEPF("  %d. %s (RSSI: %d dBm, %s)\n", 
                   i + 1,
                   networks[i].ssid.c_str(), 
                   networks[i].rssi,
@@ -523,9 +591,9 @@ static void wifiScanAndListTop5() {
     if (networks[i].isOpen && networks[i].ssid.length() > 0) {
       if (!wifiIsBlacklisted(networks[i].ssid)) {
         wifiMulti.addAP(networks[i].ssid.c_str(), "");  // Password vide pour réseau ouvert
-        Serial.printf("    → Ajouté au WiFiMulti (ouvert, portail captif possible)\n");
+        STEPF("    → Ajouté au WiFiMulti (ouvert, portail captif possible)\n");
       } else {
-        Serial.printf("    → Ignoré (blacklisté): %s\n", networks[i].ssid.c_str());
+        STEPF("    → Ignoré (blacklisté): %s\n", networks[i].ssid.c_str());
       }
     }
   }
@@ -571,7 +639,7 @@ static bool wifiDetectCaptivePortal() {
     }
     
     http.end();
-    delay(100); // Petit délai entre les tentatives
+    szDelay(100); // Petit délai entre les tentatives
   }
   
   // Si toutes les URLs échouent ou timeout, on considère qu'il y a peut-être un portail captif
@@ -601,7 +669,7 @@ static void wifiBlacklistSSID(const String& ssid) {
     blacklistedSSIDs[blacklistedCount] = ssid;
     blacklistTimestamps[blacklistedCount] = millis();
     blacklistedCount++;
-    Serial.printf("[WiFi] SSID ajouté à la blacklist: %s (pour 5 minutes)\n", ssid.c_str());
+    STEPF("[WiFi] SSID ajouté à la blacklist: %s (pour 5 minutes)\n", ssid.c_str());
   } else {
     // Remplacer le plus ancien
     int oldestIdx = 0;
@@ -612,7 +680,7 @@ static void wifiBlacklistSSID(const String& ssid) {
     }
     blacklistedSSIDs[oldestIdx] = ssid;
     blacklistTimestamps[oldestIdx] = millis();
-    Serial.printf("[WiFi] SSID remplacé dans la blacklist: %s\n", ssid.c_str());
+    STEPF("[WiFi] SSID remplacé dans la blacklist: %s\n", ssid.c_str());
   }
 }
 
@@ -625,7 +693,7 @@ static bool wifiIsBlacklisted(const String& ssid) {
         return true;
       } else {
         // Timeout expiré, retirer de la blacklist
-        Serial.printf("[WiFi] SSID retiré de la blacklist (timeout): %s\n", ssid.c_str());
+        STEPF("[WiFi] SSID retiré de la blacklist (timeout): %s\n", ssid.c_str());
         for (int j = i; j < blacklistedCount - 1; j++) {
           blacklistedSSIDs[j] = blacklistedSSIDs[j + 1];
           blacklistTimestamps[j] = blacklistTimestamps[j + 1];
@@ -647,8 +715,8 @@ static bool wifiBypassCaptivePortal() {
   // - Utiliser un User-Agent spécifique
   // - Essayer des endpoints connus de portails captifs
   
-  Serial.println("[WiFi] Portail captif détecté - contournement automatique non implémenté");
-  Serial.println("[WiFi] Le réseau nécessite une authentification manuelle via navigateur");
+  STEPLN("[WiFi] Portail captif détecté - contournement automatique non implémenté");
+  STEPLN("[WiFi] Le réseau nécessite une authentification manuelle via navigateur");
   return false; // Contournement impossible
 }
 
@@ -671,7 +739,7 @@ static void wifiTick() {
   // Afficher la connexion WiFi quand elle change
   if (currentWifiStatus != lastWifiStatus) {
     if (currentWifiStatus) {
-      Serial.printf("[WiFi] Connecté à: %s (IP: %s, RSSI: %d dBm)\n",
+      STEPF("[WiFi] Connecté à: %s (IP: %s, RSSI: %d dBm)\n",
                     WiFi.SSID().c_str(),
                     WiFi.localIP().toString().c_str(),
                     WiFi.RSSI());
@@ -680,7 +748,7 @@ static void wifiTick() {
       captivePortalChecked = false; // Réinitialiser le flag pour le nouveau réseau
       lastCaptiveCheckMs = millis();
     } else {
-      Serial.println("[WiFi] Déconnecté");
+      STEPLN("[WiFi] Déconnecté");
       ntpConfigured = false; // Réinitialiser pour la prochaine connexion
       captivePortalChecked = false;
     }
@@ -689,36 +757,36 @@ static void wifiTick() {
   
   // Vérifier le portail captif après connexion (une seule fois, après 2 secondes)
   if (currentWifiStatus && !captivePortalChecked && millis() - lastCaptiveCheckMs > 2000) {
-    Serial.println("[WiFi] Vérification portail captif...");
+    STEPLN("[WiFi] Vérification portail captif...");
     if (wifiDetectCaptivePortal()) {
-      Serial.println("[WiFi] ⚠️  PORTAL CAPTIF DÉTECTÉ");
-      Serial.println("[WiFi] Le réseau nécessite une authentification via navigateur web");
+      STEPLN("[WiFi] ⚠️  PORTAL CAPTIF DÉTECTÉ");
+      STEPLN("[WiFi] Le réseau nécessite une authentification via navigateur web");
       
       // Tenter un contournement
       if (!wifiBypassCaptivePortal()) {
         // Contournement impossible → déconnecter et chercher un autre réseau
         String currentSSID = WiFi.SSID();
-        Serial.println("[WiFi] Contournement impossible → déconnexion et recherche d'un autre réseau");
+        STEPLN("[WiFi] Contournement impossible → déconnexion et recherche d'un autre réseau");
         
         // Ajouter à la blacklist temporaire (5 minutes)
         wifiBlacklistSSID(currentSSID);
         
         // Déconnecter
         WiFi.disconnect();
-        delay(500);
+        szDelay(500);
         
         // Réinitialiser le flag pour permettre une nouvelle vérification
         captivePortalChecked = false;
         lastWifiStatus = false; // Forcer la détection de changement
         
         // Forcer une nouvelle recherche
-        Serial.println("[WiFi] Recherche d'un autre réseau WiFi...");
+        STEPLN("[WiFi] Recherche d'un autre réseau WiFi...");
         return; // Sortir de la fonction pour permettre à wifiMulti.run() de chercher un autre réseau
       } else {
-        Serial.println("[WiFi] ✓ Portail captif contourné avec succès");
+        STEPLN("[WiFi] ✓ Portail captif contourné avec succès");
       }
     } else {
-      Serial.println("[WiFi] ✓ Pas de portail captif détecté");
+      STEPLN("[WiFi] ✓ Pas de portail captif détecté");
     }
     captivePortalChecked = true;
   }
@@ -732,7 +800,7 @@ static void wifiTick() {
 // --- Contrôle LEDs simples (ON/OFF) ---
 static void ledInit() {
   pinMode(LED_WIFI_PIN, OUTPUT);
-  digitalWrite(LED_WIFI_PIN, LOW);
+  ledWifiWrite(false);
   // NOTE: LED_BLE_PIN n'est pas utilisée (pin 34 est INPUT ONLY)
   // On utilise uniquement LED_WIFI_PIN pour les deux fonctions
 }
@@ -766,7 +834,7 @@ static void ledWifiUpdate(SystemState state, bool wifiOk, bool mqttOk) {
   
   if (shouldBeOn != ledWifiState) {
     ledWifiState = shouldBeOn;
-    digitalWrite(LED_WIFI_PIN, ledWifiState ? HIGH : LOW);
+    ledWifiWrite(ledWifiState);
   }
 }
 
@@ -782,64 +850,61 @@ static void ledBleUpdate(SystemState state, bool bleOk) {
 }
 
 // Vérifie qu'au moins une LED est allumée (garantie visuelle que l'ESP est sous tension)
-// NOTE: Avec une seule LED (orange), on combine les patterns WiFi et BLE
+// Clignotement = Morse méthode Koch : 1er train = K (-.-), 2e = M (--), 3e = R (.-.), etc.
 static void ledEnsureAtLeastOneOn(SystemState state, bool wifiOk, bool mqttOk, bool bleOk) {
-  LedPattern pWifi = getWifiPattern(state, wifiOk, mqttOk);
-  LedPattern pBle = getBlePattern(state, bleOk);
-  
-  bool wifiOn = (pWifi.duty_cycle > 0);
-  bool bleOn = (pBle.duty_cycle > 0);
-  
-  // Avec une seule LED, on combine les patterns :
-  // - Si WiFi et BLE sont tous les deux ON, utiliser le pattern le plus rapide
-  // - Si un seul est ON, utiliser son pattern
-  // - Si aucun n'est ON, forcer un pattern de secours
-  
   uint32_t now = millis();
-  bool shouldBeOn = false;
-  uint32_t period = 1000;
-  
-  if (wifiOn && bleOn) {
-    // Les deux sont actifs : utiliser le pattern le plus rapide (priorité à l'activité)
-    uint32_t periodWifi = (pWifi.period_ms == 0) ? 1000 : pWifi.period_ms;
-    uint32_t periodBle = (pBle.period_ms == 0) ? 1000 : pBle.period_ms;
-    period = (periodWifi < periodBle) ? periodWifi : periodBle;
-    uint32_t cyclePos = (now - ledWifiLastToggle) % period;
-    uint32_t onTime = (period * 50) / 100; // 50% duty cycle pour pattern combiné
-    shouldBeOn = (cyclePos < onTime);
-  } else if (wifiOn) {
-    // Seulement WiFi actif
-    if (pWifi.period_ms == 0) {
-      shouldBeOn = true;
-    } else {
-      uint32_t cyclePos = (now - ledWifiLastToggle) % pWifi.period_ms;
-      uint32_t onTime = (pWifi.period_ms * pWifi.duty_cycle) / 100;
-      shouldBeOn = (cyclePos < onTime);
+  (void)state;
+  (void)wifiOk;
+  (void)mqttOk;
+  (void)bleOk;
+
+  bool baseShouldBeOn = ledMorseKochShouldBeOn(now);
+
+  // Overlay d'activité
+  bool shouldBeOn = baseShouldBeOn;
+  const uint32_t BLE_BURST_MS = 100;
+  const uint32_t MQTT_PULSE_MS = 80;
+  if (ledBleActivityMs != 0) {
+    uint32_t ageBle = now - (uint32_t)ledBleActivityMs;
+    if (ageBle < BLE_BURST_MS) {
+      shouldBeOn = ((ageBle % 24) < 20);  // 20 ms ON / 4 ms OFF
     }
-    period = pWifi.period_ms;
-  } else if (bleOn) {
-    // Seulement BLE actif
-    if (pBle.period_ms == 0) {
-      shouldBeOn = true;
-    } else {
-      uint32_t cyclePos = (now - ledBleLastToggle) % pBle.period_ms;
-      uint32_t onTime = (pBle.period_ms * pBle.duty_cycle) / 100;
-      shouldBeOn = (cyclePos < onTime);
-    }
-    period = pBle.period_ms;
-  } else {
-    // Aucun actif : pattern de secours (1s, 50%)
-    period = 1000;
-    uint32_t cyclePos = (now - ledWifiLastToggle) % period;
-    shouldBeOn = (cyclePos < period / 2);
   }
-  
+  if (shouldBeOn == baseShouldBeOn && ledMqttActivityMs != 0) {
+    uint32_t ageMqtt = now - (uint32_t)ledMqttActivityMs;
+    if (ageMqtt < MQTT_PULSE_MS && ageMqtt < 60) shouldBeOn = true;
+  }
+
+  // Failsafe: si la LED est restée OFF > 800 ms, forcer ON (évite trous d'1 min)
+  static uint32_t lastLedOffMs = 0;
+  if (shouldBeOn) lastLedOffMs = 0;
+  if (lastLedOffMs != 0 && (now - lastLedOffMs) > 800) {
+    shouldBeOn = true;
+    lastLedOffMs = 0;
+  }
+
   if (shouldBeOn != ledWifiState) {
+    if (!shouldBeOn) lastLedOffMs = now;  // mémoriser instant du passage à OFF
     ledWifiState = shouldBeOn;
-    digitalWrite(LED_WIFI_PIN, ledWifiState ? HIGH : LOW);
-    if (ledWifiLastToggle == 0 || (now - ledWifiLastToggle) >= period) {
-      ledWifiLastToggle = now;
-    }
+    ledWifiWrite(ledWifiState);
+  }
+}
+
+// Tick LED utilisable depuis des boucles/délais bloquants
+static inline void ledTickNow() {
+  bool wifiOk = (WiFi.status() == WL_CONNECTED);
+  bool mqttOk = mqtt.connected();
+  ledEnsureAtLeastOneOn(currentState, wifiOk, mqttOk, bleConnected);
+}
+
+// Delay "non bloquant visuellement": maintient LED + MQTT pendant les waits
+static void szDelay(uint32_t ms) {
+  uint32_t start = millis();
+  while ((uint32_t)(millis() - start) < ms) {
+    if (WiFi.status() == WL_CONNECTED) mqtt.loop();
+    ledTickNow();
+    uint32_t slice = (ms < 25) ? 1 : 5;
+    ::delay(slice);
   }
 }
 
@@ -849,11 +914,11 @@ static bool bleFindUartLikeChars(BLEClient* client) {
 
   std::map<std::string, BLERemoteService*>* services = client->getServices();
   if (!services) {
-    Serial.println("[BLE] Aucun service trouvé");
+    STEPLN("[BLE] Aucun service trouvé");
     return false;
   }
 
-  Serial.printf("[BLE] %d service(s) trouvé(s)\n", services->size());
+  STEPF("[BLE] %d service(s) trouvé(s)\n", services->size());
   int serviceIdx = 0;
   for (auto const& it : *services) {
     BLERemoteService* svc = it.second;
@@ -861,7 +926,7 @@ static bool bleFindUartLikeChars(BLEClient* client) {
     auto* chrs = svc->getCharacteristics();
     if (!chrs) continue;
 
-    Serial.printf("[BLE] Service %d: %d caractéristique(s)\n", serviceIdx++, chrs->size());
+    STEPF("[BLE] Service %d: %d caractéristique(s)\n", serviceIdx++, chrs->size());
     int charIdx = 0;
     for (auto const& cit : *chrs) {
       BLERemoteCharacteristic* ch = cit.second;
@@ -872,11 +937,11 @@ static bool bleFindUartLikeChars(BLEClient* client) {
       // - un char "notify" (NOTIFY) pour récupérer les réponses ELM ('>' etc.)
       if (!chrWrite && (ch->canWrite() || ch->canWriteNoResponse())) {
         chrWrite = ch;
-        Serial.printf("[BLE] Caractéristique write trouvée (idx %d)\n", charIdx);
+        STEPF("[BLE] Caractéristique write trouvée (idx %d)\n", charIdx);
       }
       if (!chrNotify && ch->canNotify()) {
         chrNotify = ch;
-        Serial.printf("[BLE] Caractéristique notify trouvée (idx %d)\n", charIdx);
+        STEPF("[BLE] Caractéristique notify trouvée (idx %d)\n", charIdx);
       }
 
       if (chrWrite && chrNotify) break;
@@ -886,18 +951,18 @@ static bool bleFindUartLikeChars(BLEClient* client) {
   }
 
   if (!chrWrite) {
-    Serial.println("[BLE] ERREUR: Aucune caractéristique write trouvée");
+    STEPLN("[BLE] ERREUR: Aucune caractéristique write trouvée");
     return false;
   }
   if (!chrNotify) {
-    Serial.println("[BLE] ERREUR: Aucune caractéristique notify trouvée");
+    STEPLN("[BLE] ERREUR: Aucune caractéristique notify trouvée");
     return false;
   }
   
-  Serial.println("[BLE] Enregistrement callback notify...");
+  STEPLN("[BLE] Enregistrement callback notify...");
   chrNotify->registerForNotify(notifyCallback);
-  Serial.println("[BLE] Callback notify enregistré");
-  delay(100); // Délai pour que les notifications soient activées
+  STEPLN("[BLE] Callback notify enregistré");
+  szDelay(100); // Délai pour que les notifications soient activées
   return true;
 }
 
@@ -912,11 +977,11 @@ struct BleDevice {
 // Scanner et lister les 5 meilleurs devices BLE (par RSSI)
 static void bleScanAndListTop5() {
   if (!BLEDevice::getInitialized()) {
-    Serial.println("[BLE] BLE non initialisé");
+    STEPLN("[BLE] BLE non initialisé");
     return;
   }
 
-  Serial.println("[BLE] Scan des devices BLE...");
+  STEPLN("[BLE] Scan des devices BLE...");
   BLEScan* scan = BLEDevice::getScan();
   scan->setActiveScan(true);
   scan->setInterval(100);
@@ -924,7 +989,7 @@ static void bleScanAndListTop5() {
 
   BLEScanResults results = scan->start(3, false);  // Scan de 3 secondes
   int deviceCount = results.getCount();
-  Serial.printf("[BLE] Scan terminé: %d device(s) trouvé(s)\n", deviceCount);
+  STEPF("[BLE] Scan terminé: %d device(s) trouvé(s)\n", deviceCount);
   
   if (deviceCount == 0) {
     scan->clearResults();
@@ -958,11 +1023,11 @@ static void bleScanAndListTop5() {
   
   // Afficher les 5 meilleurs
   int topCount = (deviceCount < 5) ? deviceCount : 5;
-  Serial.printf("[BLE] Top %d device(s) (par RSSI):\n", topCount);
+  STEPF("[BLE] Top %d device(s) (par RSSI):\n", topCount);
   for (int i = 0; i < topCount; i++) {
     const char* vlinkerStr = devices[i].isVlinker ? " [vLinker]" : "";
     const char* nameStr = devices[i].name.length() > 0 ? devices[i].name.c_str() : "(sans nom)";
-    Serial.printf("  %d. %s (%s, RSSI: %d dBm)%s\n", 
+    STEPF("  %d. %s (%s, RSSI: %d dBm)%s\n", 
                   i + 1,
                   nameStr,
                   devices[i].address.c_str(),
@@ -971,12 +1036,12 @@ static void bleScanAndListTop5() {
   }
   
   // DEBUG: Afficher TOUS les devices avec leurs noms complets
-  Serial.println("[BLE] DEBUG - Liste complète des devices:");
+  STEPLN("[BLE] DEBUG - Liste complète des devices:");
   for (int i = 0; i < deviceCount; i++) {
     BLEAdvertisedDevice device = results.getDevice(i);
     String name = String(device.getName().c_str());
     String addr = String(device.getAddress().toString().c_str());
-    Serial.printf("  [%d] Nom: '%s' (len=%d), Addr: %s, RSSI: %d\n", 
+    STEPF("  [%d] Nom: '%s' (len=%d), Addr: %s, RSSI: %d\n", 
                   i, name.c_str(), name.length(), addr.c_str(), device.getRSSI());
   }
   
@@ -988,13 +1053,13 @@ static bool bleScanForVlinker(uint32_t scanTimeMs = 5000) {
   // S'assurer qu'on n'est pas connecté avant de scanner
   if (bleClient) {
     if (bleClient->isConnected()) {
-      Serial.println("[BLE] Déconnexion avant scan...");
+      STEPLN("[BLE] Déconnexion avant scan...");
       bleClient->disconnect();
     }
     // Détruire le client pour éviter les conflits
     delete bleClient;
     bleClient = nullptr;
-    delay(300);
+    szDelay(300);
   }
 
   BLEScan* scan = BLEDevice::getScan();
@@ -1002,14 +1067,14 @@ static bool bleScanForVlinker(uint32_t scanTimeMs = 5000) {
   scan->setInterval(100);
   scan->setWindow(99);
 
-  Serial.println("[BLE] Démarrage scan...");
+  STEPLN("[BLE] Démarrage scan...");
   BLEScanResults results = scan->start(scanTimeMs / 1000, false);
-  Serial.printf("[BLE] Scan terminé: %d devices trouvés\n", results.getCount());
+  STEPF("[BLE] Scan terminé: %d devices trouvés\n", results.getCount());
   
   // Attendre un peu que le scan soit complètement terminé
-  delay(200);
+  szDelay(200);
   
-  Serial.println("[BLE] DEBUG - Recherche vLinker dans les devices scannés...");
+  STEPLN("[BLE] DEBUG - Recherche vLinker dans les devices scannés...");
   for (int i = 0; i < results.getCount(); i++) {
     BLEAdvertisedDevice device = results.getDevice(i);
     String name = String(device.getName().c_str());
@@ -1019,11 +1084,11 @@ static bool bleScanForVlinker(uint32_t scanTimeMs = 5000) {
     String pattern = String(vLinker_NamePattern);
     pattern.toUpperCase();
     
-    Serial.printf("[BLE] DEBUG - Device %d: Nom='%s' (len=%d), Addr=%s\n", 
+    STEPF("[BLE] DEBUG - Device %d: Nom='%s' (len=%d), Addr=%s\n", 
                   i, name.c_str(), name.length(), addr.c_str());
     
     if (nameUpper.indexOf(pattern) >= 0) {
-      Serial.printf("[BLE] DEBUG - MATCH trouvé ! Nom contient '%s'\n", vLinker_NamePattern);
+      STEPF("[BLE] DEBUG - MATCH trouvé ! Nom contient '%s'\n", vLinker_NamePattern);
       vLinkerAddress = device.getAddress();
       // Créer une copie du device pour la connexion
       if (vLinkerDevice) {
@@ -1031,17 +1096,17 @@ static bool bleScanForVlinker(uint32_t scanTimeMs = 5000) {
       }
       vLinkerDevice = new BLEAdvertisedDevice(device);
       vLinkerAddressValid = true;
-      Serial.printf("[BLE] Trouvé vLinker: %s (%s, RSSI: %d dBm)\n", 
+      STEPF("[BLE] Trouvé vLinker: %s (%s, RSSI: %d dBm)\n", 
                     device.getName().c_str(), 
                     vLinkerAddress.toString().c_str(),
                     device.getRSSI());
       scan->clearResults(); // Nettoyer les résultats
-      delay(300); // Délai avant de tenter la connexion
+      szDelay(300); // Délai avant de tenter la connexion
       return true;
     }
   }
-  Serial.println("[BLE] DEBUG - Aucun device ne correspond au pattern 'vLinker'");
-  Serial.printf("[BLE] DEBUG - Pattern recherché: '%s' (case insensitive)\n", vLinker_NamePattern);
+  STEPLN("[BLE] DEBUG - Aucun device ne correspond au pattern 'vLinker'");
+  STEPF("[BLE] DEBUG - Pattern recherché: '%s' (case insensitive)\n", vLinker_NamePattern);
   vLinkerAddressValid = false;
   scan->clearResults(); // Nettoyer les résultats
   return false;
@@ -1054,7 +1119,7 @@ static bool bleConnectVlinker() {
   // Si on n'a pas encore l'adresse, on scanne
   if (!vLinkerAddressValid) {
     if (!bleScanForVlinker(5000)) {
-      Serial.println("[BLE] vLinker non trouvé dans le scan");
+      STEPLN("[BLE] vLinker non trouvé dans le scan");
       return false;
     }
   }
@@ -1062,42 +1127,42 @@ static bool bleConnectVlinker() {
   // Toujours créer un nouveau client pour éviter les problèmes de réutilisation
   if (bleClient) {
     if (bleClient->isConnected()) {
-      Serial.println("[BLE] Déconnexion du client existant...");
+      STEPLN("[BLE] Déconnexion du client existant...");
       bleClient->disconnect();
-      delay(200);
+      szDelay(200);
     }
     // Détruire l'ancien client
     delete bleClient;
     bleClient = nullptr;
-    delay(200);
+    szDelay(200);
   }
 
   // Créer un nouveau client
-  Serial.println("[BLE] Création nouveau client BLE...");
+  STEPLN("[BLE] Création nouveau client BLE...");
   bleClient = BLEDevice::createClient();
   if (!bleClient) {
-    Serial.println("[BLE] ERREUR: Impossible de créer le client BLE");
+    STEPLN("[BLE] ERREUR: Impossible de créer le client BLE");
     return false;
   }
 
   // Connexion au device trouvé (utiliser l'objet device complet si disponible)
-  Serial.printf("[BLE] Tentative de connexion à %s...\n", vLinkerAddress.toString().c_str());
-  delay(200); // Délai avant la connexion
+  STEPF("[BLE] Tentative de connexion à %s...\n", vLinkerAddress.toString().c_str());
+  szDelay(200); // Délai avant la connexion
   
   bool connected = false;
   if (vLinkerDevice) {
     // Utiliser l'objet device complet (meilleure méthode)
-    Serial.println("[BLE] Connexion via device object...");
+    STEPLN("[BLE] Connexion via device object...");
     connected = bleClient->connect(vLinkerDevice);
   } else {
     // Fallback: utiliser l'adresse
-    Serial.println("[BLE] Connexion via adresse MAC...");
+    STEPLN("[BLE] Connexion via adresse MAC...");
     connected = bleClient->connect(vLinkerAddress);
   }
   
   if (!connected) {
-    Serial.println("[BLE] Échec de connexion");
-    Serial.println("[BLE] Vérifier que le vLinker n'est pas connecté à un autre appareil");
+    STEPLN("[BLE] Échec de connexion");
+    STEPLN("[BLE] Vérifier que le vLinker n'est pas connecté à un autre appareil");
     // Nettoyer le client
     if (bleClient) {
       delete bleClient;
@@ -1109,18 +1174,18 @@ static bool bleConnectVlinker() {
       vLinkerDevice = nullptr;
     }
     vLinkerAddressValid = false; // Réessayer le scan au prochain appel
-    delay(500);
+    szDelay(500);
     return false;
   }
 
-  Serial.println("[BLE] Connecté ! Attente stabilisation...");
-  delay(500); // Délai plus long pour que la connexion se stabilise
+  STEPLN("[BLE] Connecté ! Attente stabilisation...");
+  szDelay(500); // Délai plus long pour que la connexion se stabilise
 
-  Serial.println("[BLE] Recherche des caractéristiques UART...");
+  STEPLN("[BLE] Recherche des caractéristiques UART...");
   if (!bleFindUartLikeChars(bleClient)) {
-    Serial.println("[BLE] Caractéristiques UART non trouvées");
+    STEPLN("[BLE] Caractéristiques UART non trouvées");
     bleClient->disconnect();
-    delay(200);
+    szDelay(200);
     delete bleClient;
     bleClient = nullptr;
     if (vLinkerDevice) {
@@ -1131,7 +1196,7 @@ static bool bleConnectVlinker() {
     return false;
   }
 
-  Serial.println("[BLE] Caractéristiques UART trouvées (write+notify)");
+  STEPLN("[BLE] Caractéristiques UART trouvées (write+notify)");
   return true;
 }
 
@@ -1143,14 +1208,15 @@ static void elmClearRx() {
 
 static bool elmWriteLine(const String& line) {
   if (!bleClient || !bleClient->isConnected() || !chrWrite) {
-    Serial.println("[ELM] ERREUR: Client BLE non connecté ou caractéristique write absente");
+    STEPLN("[ELM] ERREUR: Client BLE non connecté ou caractéristique write absente");
     return false;
   }
   String cmd = line;
   if (!cmd.endsWith("\r")) cmd += "\r";
-  Serial.printf("[ELM] TX: %s", cmd.c_str());
+  STEPF("[ELM] TX: %s", cmd.c_str());
+  ledNoteBleActivity();
   chrWrite->writeValue((uint8_t*)cmd.c_str(), cmd.length(), false);
-  delay(10); // Petit délai après l'envoi
+  szDelay(10); // Petit délai après l'envoi
   return true;
 }
 
@@ -1163,20 +1229,21 @@ static bool elmReadUntilPrompt(String& out, uint32_t timeoutMs = 1500) {
       out = rxBuf.substring(0, idx);
       // on garde ce qui suit le prompt (rare mais safe)
       rxBuf = rxBuf.substring(idx + 1);
-      Serial.printf("[ELM] RX: %s>\n", out.c_str());
+      STEPF("[ELM] RX: %s>\n", out.c_str());
       return true;
     }
     // Afficher ce qui est reçu même sans prompt (pour debug)
     if (rxBuf.length() > 0 && (millis() - start) % 200 < 10) {
-      Serial.printf("[ELM] RX (partiel, %d ms): %s\n", (int)(millis() - start), rxBuf.c_str());
+      STEPF("[ELM] RX (partiel, %d ms): %s\n", (int)(millis() - start), rxBuf.c_str());
     }
-    delay(5);
+    ledTickNow();
+    ::delay(5);
   }
   out = rxBuf;
   if (out.length() > 0) {
-    Serial.printf("[ELM] RX (timeout, %d ms): %s\n", timeoutMs, out.c_str());
+    STEPF("[ELM] RX (timeout, %d ms): %s\n", timeoutMs, out.c_str());
   } else {
-    Serial.printf("[ELM] RX (timeout, %d ms): Aucune réponse\n", timeoutMs);
+    STEPF("[ELM] RX (timeout, %d ms): Aucune réponse\n", timeoutMs);
   }
   return false;
 }
@@ -1184,7 +1251,7 @@ static bool elmReadUntilPrompt(String& out, uint32_t timeoutMs = 1500) {
 static String elmQuery(const String& line, uint32_t timeoutMs = 1500) {
   elmClearRx();
   if (!elmWriteLine(line)) {
-    Serial.println("[ELM] ERREUR: Impossible d'envoyer la commande");
+    STEPLN("[ELM] ERREUR: Impossible d'envoyer la commande");
     return "";
   }
   String resp;
@@ -1193,178 +1260,35 @@ static String elmQuery(const String& line, uint32_t timeoutMs = 1500) {
   resp.replace("\n", "");
   resp.trim();
   if (!gotResponse) {
-    Serial.printf("[ELM] ATTENTION: Pas de réponse complète pour '%s'\n", line.c_str());
+    STEPF("[ELM] ATTENTION: Pas de réponse complète pour '%s'\n", line.c_str());
   }
   return resp;
 }
 
-// Convertit une chaîne hex ASCII (ex: "61A0FF...") en bytes.
-// Ignore espaces, ':' etc.
-static size_t hexToBytes(const String& hex, uint8_t* out, size_t outMax) {
-  auto isHex = [](char c) -> bool {
-    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-  };
-  auto hexVal = [](char c) -> uint8_t {
-    if (c >= '0' && c <= '9') return (uint8_t)(c - '0');
-    if (c >= 'a' && c <= 'f') return (uint8_t)(10 + (c - 'a'));
-    return (uint8_t)(10 + (c - 'A'));
-  };
+// Extrait la vitesse (km/h) depuis une réponse OBD-II standard PID 010D.
+// Recherche la séquence "410D" dans la réponse (robuste aux espaces / entêtes / formatage ELM).
+static bool parseObdPid010D_SpeedKmh(const String& resp, float& outSpeedKmh) {
+  String s = resp;
+  s.toUpperCase();
 
-  size_t n = 0;
-  int i = 0;
-  while (i < (int)hex.length() && n < outMax) {
-    while (i < (int)hex.length() && !isHex(hex[i])) i++;
-    if (i >= (int)hex.length()) break;
-    char hi = hex[i++];
-    while (i < (int)hex.length() && !isHex(hex[i])) i++;
-    if (i >= (int)hex.length()) break;
-    char lo = hex[i++];
-    out[n++] = (uint8_t)((hexVal(hi) << 4) | hexVal(lo));
+  // Garder uniquement [0-9A-F] pour faciliter la recherche.
+  String hex;
+  hex.reserve(s.length());
+  for (int i = 0; i < (int)s.length(); i++) {
+    char c = s[i];
+    bool isHex = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F');
+    if (isHex) hex += c;
   }
-  return n;
-}
 
-// --- Décodage (basé sur analyse OCR) ---
-// Décodage des 20 champs depuis les pages hexadécimales.
-// Offsets et échelles identifiés via analyse des données OCR synchronisées.
-// Note: Certains champs partagent le même offset (ex: speed_kmh et accelerator_pct à offset 6)
-//       → À affiner avec plus de données ou reverse engineering manuel
-static void decodeSzFromPages(
-  const uint8_t* a0, size_t a0Len,
-  const uint8_t* a2, size_t a2Len,
-  const uint8_t* a5, size_t a5Len,
-  const uint8_t* cd, size_t cdLen,
-  SzData& out
-) {
-  // Page 21A0
-  if (a0Len > 7) {
-    // Note: speed_kmh et accelerator_pct partagent offset 6 → conflit à résoudre
-    // Filtrer les valeurs aberrantes pour speed_kmh (0-300 km/h raisonnable)
-    uint16_t raw_speed = (a0[6] << 8) | a0[7];
-    float speed = (float)raw_speed;
-    if (speed >= 0.0f && speed <= 300.0f) {
-      out.speed_kmh = speed;
-    }
-    // accelerator_pct: même offset que speed_kmh, à utiliser si speed_kmh est invalide
-    if (speed < 0.0f || speed > 300.0f) {
-      out.accelerator_pct = speed;  // Probablement accelerator_pct si hors plage vitesse
-    }
-  }
-  if (a0Len > 9) {
-    // air_temp_c (offset 8, scale 0.25)
-    uint16_t raw_air_temp = (a0[8] << 8) | a0[9];
-    out.air_temp_c = (float)raw_air_temp * 0.25f;
-  }
-  if (a0Len > 19) {
-    // abs_pressure_mbar (offset 18, scale 1.0)
-    uint16_t raw_abs_press = (a0[18] << 8) | a0[19];
-    out.abs_pressure_mbar = (float)raw_abs_press;
-  }
-  if (a0Len > 21) {
-    // air_flow_estimate_mgcp (offset 20, scale 0.1)
-    uint16_t raw_air_flow_est = (a0[20] << 8) | a0[21];
-    out.air_flow_estimate_mgcp = (float)raw_air_flow_est * 0.1f;
-  }
-  if (a0Len > 23) {
-    // air_flow_request_mgcp (offset 22, scale 1.0)
-    uint16_t raw_air_flow_req = (a0[22] << 8) | a0[23];
-    out.air_flow_request_mgcp = (float)raw_air_flow_req;
-    // battery_v (offset 22, scale 0.05) - même offset, utiliser pour battery_v si air_flow_request semble invalide
-    // Note: Conflit d'offset, à affiner
-    float battery_candidate = (float)raw_air_flow_req * 0.05f;
-    if (battery_candidate >= 10.0f && battery_candidate <= 15.0f) {
-      out.battery_v = battery_candidate;
-    }
-  }
-  if (a0Len > 27) {
-    // rail_pressure_bar (offset 26, scale 0.1)
-    // Note: fuel_temp_c pourrait aussi être ici (offset 26, scale 1.0), conflit à résoudre
-    uint16_t raw_rail_press = (a0[26] << 8) | a0[27];
-    out.rail_pressure_bar = (float)raw_rail_press * 0.1f;
-    // fuel_temp_c candidat (offset 26, scale 1.0)
-    float fuel_temp_candidate = (float)raw_rail_press * 1.0f;
-    if (fuel_temp_candidate >= 20.0f && fuel_temp_candidate <= 50.0f) {
-      out.fuel_temp_c = fuel_temp_candidate;
-    }
-  }
-  if (a0Len > 29) {
-    // rail_pressure_control_bar (offset 28, scale 0.1)
-    uint16_t raw_rail_press_ctrl = (a0[28] << 8) | a0[29];
-    out.rail_pressure_control_bar = (float)raw_rail_press_ctrl * 0.1f;
-  }
-  if (a0Len > 5) {
-    // desired_idle_speed_rpm (offset 4, scale 0.25)
-    uint16_t raw_idle_rpm = (a0[4] << 8) | a0[5];
-    out.desired_idle_speed_rpm = (float)raw_idle_rpm * 0.25f;
-  }
-  if (a0Len > 13) {
-    // engine_rpm (offset 12, scale 0.25) - approximation, à affiner
-    uint16_t raw_rpm = (a0[12] << 8) | a0[13];
-    float rpm = (float)raw_rpm * 0.25f;
-    if (rpm >= 0.0f && rpm <= 10000.0f) {  // Filtrer valeurs aberrantes
-      out.engine_rpm = rpm;
-    }
-  }
-  if (a0Len > 35) {
-    uint16_t raw_req_press = (a0[34] << 8) | a0[35];
-    out.requested_in_pressure_mbar = (float)raw_req_press;
-  }
-  if (a0Len > 45) {
-    // gear_ratio (offset 44, scale 1.0)
-    uint16_t raw_gear = (a0[44] << 8) | a0[45];
-    out.gear_ratio = (float)raw_gear;
-  }
-  
-  // Page 21A2
-  if (a2Len > 3) {
-    uint16_t raw_bar_mmhg = (a2[2] << 8) | a2[3];
-    out.bar_pressure_mmhg = (float)raw_bar_mmhg * 5.0f;
-  }
-  if (a2Len > 5) {
-    // desired_egr_position_pct (offset 4, scale 100.0)
-    // Note: Les valeurs OCR montrent 0-6403%, donc scale 100.0 semble correct
-    // mais peut-être que c'est en centièmes de pourcent (64.03% au lieu de 6403%)
-    uint16_t raw_egr_desired = (a2[4] << 8) | a2[5];
-    float egr_pct = (float)raw_egr_desired * 100.0f;
-    // Si > 100%, c'est probablement en centièmes, diviser par 100
-    if (egr_pct > 100.0f) {
-      out.desired_egr_position_pct = egr_pct / 100.0f;
-    } else {
-      out.desired_egr_position_pct = egr_pct;
-    }
-  }
-  if (a2Len > 13) {
-    // egr_position_pct (offset 12, scale 0.25)
-    uint16_t raw_egr = (a2[12] << 8) | a2[13];
-    out.egr_position_pct = (float)raw_egr * 0.25f;
-  }
-  if (a2Len > 21) {
-    // engine_temp_c (offset 20, scale 0.01)
-    uint16_t raw_engine_temp = (a2[20] << 8) | a2[21];
-    out.engine_temp_c = (float)raw_engine_temp * 0.01f;
-  }
-  if (a2Len > 23) {
-    uint16_t raw_bar_kpa = (a2[22] << 8) | a2[23];
-    out.bar_pressure_kpa = (float)raw_bar_kpa / 10.0f;
-  }
-  
-  // Page 21A5
-  if (a5Len > 5) {
-    // egr_position_pct (offset 4, scale 0.25) - alternative à 21A2
-    // Note: 21A5 offset 4 semble plus précis selon l'analyse
-    uint16_t raw_egr = (a5[4] << 8) | a5[5];
-    out.egr_position_pct = (float)raw_egr * 0.25f;
-  }
-  // Note: battery_v et fuel_temp_c ont été déplacés vers 21A0 pour résoudre les conflits
-  // Anciens offsets (21A5) étaient incorrects
-  
-  // Page 21CD
-  // Note: requested_in_pressure_mbar pourrait aussi être ici (offset 2, scale 4.0)
-  // mais 21A0 offset 34 semble plus fiable
-  
-  // Champs non encore identifiés avec certitude:
-  // - engine_rpm: plusieurs candidats (offset 12 ou 28 dans 21A0, à vérifier)
-  // - intake_c: valeur constante -50.0 dans les données, difficile à valider
+  int idx = hex.indexOf("410D");
+  if (idx < 0) return false;
+  if (idx + 6 > (int)hex.length()) return false;
+
+  String byteHex = hex.substring(idx + 4, idx + 6);
+  int v = (int)strtol(byteHex.c_str(), nullptr, 16);
+  if (v < 0 || v > 255) return false;
+  outSpeedKmh = (float)v;
+  return true;
 }
 
 // --- JSON publish ---
@@ -1373,14 +1297,23 @@ static void publishSzJson(const SzData& d, const String& rawA0, const String& ra
   mqtt.loop();
   
   if (!mqttEnsureConnected()) {
-    Serial.println("[PUB] ERREUR: MQTT non connecté");
+    STEPLN("[PUB] ERREUR: MQTT non connecté");
     return;
   }
 
-  StaticJsonDocument<1024> doc;
+  // datetime lisible (si NTP OK) ou "UPTIME: ..." sinon
+  configureNTP();
+
+  StaticJsonDocument<1280> doc;
   doc["app"] = app_name;
   doc["ver"] = version;
   doc["ts_ms"] = (uint32_t)millis();
+  doc["datetime"] = getReadableDateTime();
+#if USE_OBD2_PROTOCOL
+  doc["protocol"] = "obd2";
+#else
+  doc["protocol"] = "sz";
+#endif
 
   auto putOrNull = [&](const char* k, float v) {
     if (isnan(v)) doc[k] = nullptr;
@@ -1417,14 +1350,14 @@ static void publishSzJson(const SzData& d, const String& rawA0, const String& ra
   raw["21A5"] = rawA5;
   raw["21CD"] = rawCD;
 
-  char payload[1024];
+  char payload[1400];
   size_t n = serializeJson(doc, payload, sizeof(payload));
   
   // Vérifier l'état de la connexion avant publication
   if (!mqtt.connected()) {
-    Serial.printf("[PUB] ERREUR: MQTT déconnecté avant publication\n");
+    STEPF("[PUB] ERREUR: MQTT déconnecté avant publication\n");
     if (!mqttEnsureConnected()) {
-      Serial.println("[PUB] ERREUR: Impossible de reconnecter MQTT");
+      STEPLN("[PUB] ERREUR: Impossible de reconnecter MQTT");
       return;
     }
   }
@@ -1432,21 +1365,25 @@ static void publishSzJson(const SzData& d, const String& rawA0, const String& ra
   // Vérifier la mémoire avant publication
   uint32_t freeHeap = ESP.getFreeHeap();
   if (freeHeap < 10000) {
-    Serial.printf("[PUB] ATTENTION: Mémoire libre très faible (%u bytes) avant publication\n", freeHeap);
+    STEPF("[PUB] ATTENTION: Mémoire libre très faible (%u bytes) avant publication\n", freeHeap);
   }
   
   // Utiliser la signature avec uint8_t* et longueur (plus fiable)
   bool pubOk = mqtt.publish(topic_sz, (uint8_t*)payload, n, false); // QoS 0
   if (pubOk) {
-    Serial.printf("[PUB] OK: %s (%d bytes) - mémoire libre: %u bytes\n", topic_sz, n, ESP.getFreeHeap());
-    // Appeler loop() après publication pour envoyer le message
-    mqtt.loop();
+    STEPF("[PUB] OK: %s (%d bytes) - mémoire libre: %u bytes\n", topic_sz, n, ESP.getFreeHeap());
+    ledNoteMqttActivity();
+    // Flush: plusieurs loop() + court délai pour que le paquet TCP soit bien envoyé
+    for (int i = 0; i < 10; i++) {
+      mqtt.loop();
+      delay(2);
+    }
   } else {
-    Serial.printf("[PUB] FAIL: %s (%d bytes) - connected=%d, state=%d, mémoire=%u bytes\n", 
+    STEPF("[PUB] FAIL: %s (%d bytes) - connected=%d, state=%d, mémoire=%u bytes\n", 
                   topic_sz, n, mqtt.connected(), mqtt.state(), ESP.getFreeHeap());
     // Tenter de reconnecter si déconnecté
     if (!mqtt.connected()) {
-      Serial.println("[PUB] MQTT déconnecté, tentative de reconnexion...");
+      STEPLN("[PUB] MQTT déconnecté, tentative de reconnexion...");
       mqttEnsureConnected();
     }
   }
@@ -1455,13 +1392,17 @@ static void publishSzJson(const SzData& d, const String& rawA0, const String& ra
   if (rawA0.length() || rawA2.length() || rawA5.length() || rawCD.length()) {
     StaticJsonDocument<768> dbg;
     dbg["ts_ms"] = (uint32_t)millis();
+    dbg["datetime"] = getReadableDateTime();
     dbg["21A0"] = rawA0;
     dbg["21A2"] = rawA2;
     dbg["21A5"] = rawA5;
     dbg["21CD"] = rawCD;
     char p2[768];
     size_t n2 = serializeJson(dbg, p2, sizeof(p2));
-    mqtt.publish(topic_debug, (uint8_t*)p2, n2);
+    if (mqtt.publish(topic_debug, (uint8_t*)p2, n2)) {
+      ledNoteMqttActivity();
+      for (int i = 0; i < 5; i++) { mqtt.loop(); delay(2); }
+    }
   }
 }
 
@@ -1518,20 +1459,20 @@ static bool elmInitLikeSzViewer() {
     // Vérifier si la réponse contient "OK" (pas "ERROR")
     // La réponse peut être "BUS INIT: OK" ou juste "OK"
     if (fi.indexOf("OK") >= 0 && fi.indexOf("ERROR") < 0) {
-      Serial.printf("[ELM] ATFI réussi après %d tentative(s)\n", i + 1);
+      STEPF("[ELM] ATFI réussi après %d tentative(s)\n", i + 1);
       atfiOk = true;
       break;
     }
-    Serial.printf("[ELM] ATFI échoué (tentative %d/%d): %s\n", i + 1, maxRetries, fi.c_str());
+    STEPF("[ELM] ATFI échoué (tentative %d/%d): %s\n", i + 1, maxRetries, fi.c_str());
     if (i < maxRetries - 1) {
-      delay(500); // Petit délai avant de réessayer
+      szDelay(500); // Petit délai avant de réessayer
       doConfigSequence(); // Refaire la séquence de configuration
     }
   }
   
   if (!atfiOk) {
-    Serial.println("[ELM] ERREUR: ATFI a échoué après toutes les tentatives");
-    Serial.println("[ELM] Vérifiez que le contact est allumé et que le vLinker est bien connecté");
+    STEPLN("[ELM] ERREUR: ATFI a échoué après toutes les tentatives");
+    STEPLN("[ELM] Vérifiez que le contact est allumé et que le vLinker est bien connecté");
     return false;
   }
   
@@ -1539,6 +1480,98 @@ static bool elmInitLikeSzViewer() {
   elmQuery("ATKW");
   return true;
 }
+
+#if USE_OBD2_PROTOCOL
+// Init ELM pour OBD2 (profil Suzuki OBD-II / EOBD, comme Car Scanner). Pas d'ATSH fixe, pas d'ATFI.
+static bool elmInitObd2() {
+  elmQuery("ATZ", 2000);
+  elmQuery("ATE0");
+  elmQuery("ATD0");
+  elmQuery("ATH1");
+  elmQuery("ATSP0");   // auto protocol
+  elmQuery("ATST64");  // timeout
+  elmQuery("ATM0");
+  elmQuery("ATS0");
+  elmQuery("ATAT1");
+  elmQuery("ATAL");
+  String r0100 = elmQuery("0100", 2000);
+  if (r0100.indexOf("NO DATA") >= 0 || r0100.indexOf("UNABLE") >= 0) {
+    STEPLN("[ELM] OBD2 init: 0100 sans réponse, véhicule peut ne pas supporter mode 01");
+  } else {
+    STEPF("[ELM] OBD2 init OK (0100 réponse reçue)\n");
+  }
+  return true;
+}
+
+// Collecte OBD2: envoie PIDs 0105, 010B, 010C, 010D, 0110, 0111, 0123 + ATRV, décode vers SzData.
+static bool pollObd2AndCollect() {
+  String r0105 = elmQuery("0105", 800);
+  String r010B = elmQuery("010B", 800);
+  String r010C = elmQuery("010C", 800);
+  String r010D = elmQuery("010D", 800);
+  String r0110 = elmQuery("0110", 800);
+  String r0111 = elmQuery("0111", 800);
+  String r0123 = elmQuery("0123", 800);
+  String atrv = elmQuery("ATRV", 400);
+
+  if (r010C.indexOf("NO DATA") >= 0 && r010D.indexOf("NO DATA") >= 0) {
+    STEPLN("[ELM] OBD2 NO DATA → contact coupé ?");
+    return false;
+  }
+
+  SzData d;
+  decodeObd2ToSzData(
+    nullptr, r0105.c_str(), r010B.c_str(),
+    r010C.c_str(), r010D.c_str(), r0110.c_str(), r0111.c_str(),
+    r0123.c_str(), atrv.c_str(),
+    d
+  );
+
+  static SzData lastSz;
+  #define OBD2_MERGE(field) do { \
+    if (isnan(d.field)) { if (!isnan(lastSz.field)) d.field = lastSz.field; } \
+    else { lastSz.field = d.field; } \
+  } while(0)
+  OBD2_MERGE(desired_idle_speed_rpm);
+  OBD2_MERGE(accelerator_pct);
+  OBD2_MERGE(intake_c);
+  OBD2_MERGE(battery_v);
+  OBD2_MERGE(fuel_temp_c);
+  OBD2_MERGE(bar_pressure_kpa);
+  OBD2_MERGE(bar_pressure_mmhg);
+  OBD2_MERGE(abs_pressure_mbar);
+  OBD2_MERGE(air_flow_estimate_mgcp);
+  OBD2_MERGE(air_flow_request_mgcp);
+  OBD2_MERGE(speed_kmh);
+  OBD2_MERGE(rail_pressure_bar);
+  OBD2_MERGE(rail_pressure_control_bar);
+  OBD2_MERGE(desired_egr_position_pct);
+  OBD2_MERGE(gear_ratio);
+  OBD2_MERGE(egr_position_pct);
+  OBD2_MERGE(engine_temp_c);
+  OBD2_MERGE(air_temp_c);
+  OBD2_MERGE(requested_in_pressure_mbar);
+  OBD2_MERGE(engine_rpm);
+  #undef OBD2_MERGE
+
+  String rawObd2;
+  rawObd2 += "0105:"; rawObd2 += r0105;
+  rawObd2 += " 010B:"; rawObd2 += r010B;
+  rawObd2 += " 010C:"; rawObd2 += r010C;
+  rawObd2 += " 010D:"; rawObd2 += r010D;
+  rawObd2 += " 0110:"; rawObd2 += r0110;
+  rawObd2 += " 0111:"; rawObd2 += r0111;
+  rawObd2 += " 0123:"; rawObd2 += r0123;
+  rawObd2 += " ATRV:"; rawObd2 += atrv;
+
+  if (fifoPush(d, rawObd2, "", "", "")) {
+    STEPF("[FIFO] OBD2 trame ajoutée (%d/%d)\n", fifoCount, FIFO_BUFFER_SIZE);
+  } else {
+    STEPF("[FIFO] Buffer plein, trame perdue\n");
+  }
+  return true;
+}
+#endif
 
 // Parse les DTC depuis une réponse hex (format: "43 01 33 00 00 00 00")
 // Retourne le nombre de DTC trouvés et les stocke dans le tableau dtcs
@@ -1600,20 +1633,21 @@ static int parseDTCs(const String& hexResponse, String* dtcs, int maxDtcs) {
 // Lit les DTC via ELM327 (Mode 03: Request DTCs)
 static bool readAndPublishDTCs() {
   if (!mqttEnsureConnected()) {
-    Serial.println("[DTC] ERREUR: MQTT non connecté");
+    STEPLN("[DTC] ERREUR: MQTT non connecté");
     return false;
   }
   
-  Serial.println("[DTC] Lecture des DTC...");
+  STEPLN("[DTC] Lecture des DTC...");
   String response = elmQuery("03", 2000);
   
   if (response.indexOf("NO DATA") >= 0 || response.indexOf("ERROR") >= 0) {
-    Serial.println("[DTC] Pas de DTC ou erreur de lecture");
+    STEPLN("[DTC] Pas de DTC ou erreur de lecture");
     // Publier un JSON vide pour indiquer qu'il n'y a pas de DTC
     StaticJsonDocument<256> doc;
     doc["app"] = app_name;
     doc["ver"] = version;
     doc["ts_ms"] = (uint32_t)millis();
+    doc["datetime"] = getReadableDateTime();
     doc["dtcs"] = JsonArray();
     doc["count"] = 0;
     
@@ -1632,6 +1666,7 @@ static bool readAndPublishDTCs() {
   doc["app"] = app_name;
   doc["ver"] = version;
   doc["ts_ms"] = (uint32_t)millis();
+  doc["datetime"] = getReadableDateTime();
   doc["count"] = dtcCount;
   
   JsonArray dtcArray = doc.createNestedArray("dtcs");
@@ -1646,11 +1681,12 @@ static bool readAndPublishDTCs() {
   size_t n = serializeJson(doc, payload, sizeof(payload));
   
   if (mqtt.publish(topic_dtc, (uint8_t*)payload, n, false)) {
-    Serial.printf("[DTC] OK: %d DTC(s) publié(s) - %s\n", dtcCount, topic_dtc);
-    mqtt.loop();
+    STEPF("[DTC] OK: %d DTC(s) publié(s) - %s\n", dtcCount, topic_dtc);
+    ledNoteMqttActivity();
+    for (int i = 0; i < 8; i++) { mqtt.loop(); delay(2); }
     return true;
   } else {
-    Serial.printf("[DTC] FAIL: Publication échouée\n");
+    STEPF("[DTC] FAIL: Publication échouée\n");
     return false;
   }
 }
@@ -1666,25 +1702,73 @@ static bool pollSzPagesAndCollect() {
   // Détecter "NO DATA" → contact coupé, réinitialiser ELM
   if (rA0.indexOf("NO DATA") >= 0 || rA2.indexOf("NO DATA") >= 0 || 
       rA5.indexOf("NO DATA") >= 0 || rCD.indexOf("NO DATA") >= 0) {
-    Serial.println("[ELM] NO DATA détecté → contact coupé, réinitialisation ELM...");
+    STEPLN("[ELM] NO DATA détecté → contact coupé, réinitialisation ELM...");
     return false;  // Indique qu'il faut réinitialiser
+  }
+
+  // Vitesse standard OBD-II (PID 010D) : plus fiable que l'offset propriétaire.
+  // Limiter la fréquence pour ne pas surcharger le bus.
+  static unsigned long last010Dms = 0;
+  float speed010D = NAN;
+  if (millis() - last010Dms > 500) {
+    last010Dms = millis();
+    // Certains ECU ne répondent au mode 01 qu'avec l'entête "standard" KWP (686AF1).
+    // On bascule temporairement l'entête, puis on restaure celui de SZ Viewer (817AF1).
+    elmQuery("ATSH686AF1");
+    String r010D = elmQuery("010D", 900);
+    elmQuery("ATSH817AF1");
+    (void)parseObdPid010D_SpeedKmh(r010D, speed010D);
   }
 
   // Convert to bytes for decoding
   uint8_t bA0[256], bA2[256], bA5[256], bCD[64];
-  size_t nA0 = hexToBytes(rA0, bA0, sizeof(bA0));
-  size_t nA2 = hexToBytes(rA2, bA2, sizeof(bA2));
-  size_t nA5 = hexToBytes(rA5, bA5, sizeof(bA5));
-  size_t nCD = hexToBytes(rCD, bCD, sizeof(bCD));
+  size_t nA0 = szDecodeHexToBytes(rA0, bA0, sizeof(bA0));
+  size_t nA2 = szDecodeHexToBytes(rA2, bA2, sizeof(bA2));
+  size_t nA5 = szDecodeHexToBytes(rA5, bA5, sizeof(bA5));
+  size_t nCD = szDecodeHexToBytes(rCD, bCD, sizeof(bCD));
 
   SzData d;
   decodeSzFromPages(bA0, nA0, bA2, nA2, bA5, nA5, bCD, nCD, d);
 
+  // Conserver la dernière valeur connue pour les champs non remontés (trame courte / absente)
+  static SzData lastSz;
+  #define SZ_MERGE(field) do { \
+    if (isnan(d.field)) { if (!isnan(lastSz.field)) d.field = lastSz.field; } \
+    else { lastSz.field = d.field; } \
+  } while(0)
+  SZ_MERGE(desired_idle_speed_rpm);
+  SZ_MERGE(accelerator_pct);
+  SZ_MERGE(intake_c);
+  SZ_MERGE(battery_v);
+  SZ_MERGE(fuel_temp_c);
+  SZ_MERGE(bar_pressure_kpa);
+  SZ_MERGE(bar_pressure_mmhg);
+  SZ_MERGE(abs_pressure_mbar);
+  SZ_MERGE(air_flow_estimate_mgcp);
+  SZ_MERGE(air_flow_request_mgcp);
+  SZ_MERGE(speed_kmh);
+  SZ_MERGE(rail_pressure_bar);
+  SZ_MERGE(rail_pressure_control_bar);
+  SZ_MERGE(desired_egr_position_pct);
+  SZ_MERGE(gear_ratio);
+  SZ_MERGE(egr_position_pct);
+  SZ_MERGE(engine_temp_c);
+  SZ_MERGE(air_temp_c);
+  SZ_MERGE(requested_in_pressure_mbar);
+  SZ_MERGE(engine_rpm);
+  #undef SZ_MERGE
+
+  // Override speed_kmh si PID 010D disponible et plausible
+  if (!isnan(speed010D) && speed010D >= 0.0f && speed010D <= 250.0f) {
+    d.speed_kmh = speed010D;
+    lastSz.speed_kmh = speed010D;
+  }
+
   // Ajouter au buffer FIFO (priorité: collecte continue)
   if (fifoPush(d, rA0, rA2, rA5, rCD)) {
-    Serial.printf("[FIFO] Trame ajoutée (%d/%d)\n", fifoCount, FIFO_BUFFER_SIZE);
+    STEPF("[FIFO] Trame ajoutée (%d/%d)\n", fifoCount, FIFO_BUFFER_SIZE);
   } else {
-    Serial.printf("[FIFO] Buffer plein, trame perdue\n");
+    STEPF("[FIFO] Buffer plein, trame perdue\n");
   }
   
   return true;
@@ -1696,7 +1780,7 @@ static void fifoSendToMqtt() {
   
   if (!mqttEnsureConnected()) {
     if (millis() - lastDebugMs > 5000) {
-      Serial.printf("[FIFO] DEBUG - MQTT non connecté, buffer: %d/%d trames\n", fifoCount, FIFO_BUFFER_SIZE);
+      STEPF("[FIFO] DEBUG - MQTT non connecté, buffer: %d/%d trames\n", fifoCount, FIFO_BUFFER_SIZE);
       lastDebugMs = millis();
     }
     return;  // Pas de WiFi/MQTT, on garde les trames dans le buffer
@@ -1704,13 +1788,13 @@ static void fifoSendToMqtt() {
   
   if (fifoCount == 0) {
     if (millis() - lastDebugMs > 10000) {
-      Serial.println("[FIFO] DEBUG - Buffer vide (pas de données collectées)");
+      STEPLN("[FIFO] DEBUG - Buffer vide (pas de données collectées)");
       lastDebugMs = millis();
     }
     return;
   }
   
-  Serial.printf("[FIFO] DEBUG - Envoi de %d trame(s) depuis le buffer\n", (fifoCount < 5) ? fifoCount : 5);
+  STEPF("[FIFO] DEBUG - Envoi de %d trame(s) depuis le buffer\n", (fifoCount < 5) ? fifoCount : 5);
   
   // Envoyer jusqu'à 5 trames par cycle pour ne pas surcharger
   int sent = 0;
@@ -1722,7 +1806,7 @@ static void fifoSendToMqtt() {
     if (fifoPop(d, rawA0, rawA2, rawA5, rawCD, timestamp_ms)) {
       publishSzJson(d, rawA0, rawA2, rawA5, rawCD);
       sent++;
-      Serial.printf("[FIFO] Trame envoyée (%d restantes)\n", fifoCount);
+      STEPF("[FIFO] Trame envoyée (%d restantes)\n", fifoCount);
     } else {
       break;
     }
@@ -1733,10 +1817,15 @@ void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 3000) {}
 
-  Serial.println("\n========================================");
-  Serial.printf("  APP: %s\n", app_name);
-  Serial.printf("  VER: %s\n", version);
-  Serial.println("========================================");
+  STEPLN("\n========================================");
+  STEPF("  APP: %s\n", app_name);
+  STEPF("  VER: %s\n", version);
+#if USE_OBD2_PROTOCOL
+  STEPLN("  PROTOCOL: OBD2 (Car Scanner PIDs)");
+#else
+  STEPLN("  PROTOCOL: SZ (21A0/21A2/21A5/21CD)");
+#endif
+  STEPLN("========================================");
 
   // --- WiFi Multi-AP (adapter à ton contexte) ---
   // IMPORTANT: garde tes APs existants si tu merges avec ton autre sketch.
@@ -1757,20 +1846,20 @@ void setup() {
   
   // Initialisation LEDs
   ledInit();
-  Serial.println("[LED] LEDs initialisées");
-  Serial.println("[LED] NOTE: Pin 34 est INPUT ONLY sur ESP32");
-  Serial.println("[LED] Utilisation d'une seule LED (orange) pour WiFi et BLE");
-  Serial.println("[LED] Les patterns seront combinés selon l'état");
+  STEPLN("[LED] LEDs initialisées");
+  STEPLN("[LED] NOTE: Pin 34 est INPUT ONLY sur ESP32");
+  STEPLN("[LED] Utilisation d'une seule LED (orange) pour WiFi et BLE");
+  STEPLN("[LED] Les patterns seront combinés selon l'état");
   
   // Test de la LED orange au démarrage
-  Serial.println("[LED] Test LED orange (WiFi/BLE combiné)...");
+  STEPLN("[LED] Test LED orange (WiFi/BLE combiné)...");
   for (int i = 0; i < 5; i++) {
-    digitalWrite(LED_WIFI_PIN, HIGH);
+    ledWifiWrite(true);
     delay(200);
-    digitalWrite(LED_WIFI_PIN, LOW);
+    ledWifiWrite(false);
     delay(200);
   }
-  Serial.println("[LED] Test LED terminé");
+  STEPLN("[LED] Test LED terminé");
 }
 
 void loop() {
@@ -1778,6 +1867,13 @@ void loop() {
 
   bool wifiOk = (WiFi.status() == WL_CONNECTED);
   bool mqttOk = mqtt.connected();
+
+  // Étapes visibles: si l'état change, on "resynchronise" la LED pour que le pattern change
+  static SystemState lastLedState = BOOT;
+  if (currentState != lastLedState) {
+    ledMarkStep();
+    lastLedState = currentState;
+  }
 
   // Toujours appeler mqtt.loop() si WiFi est connecté (même si MQTT est déconnecté)
   // Cela permet à PubSubClient de gérer la reconnexion automatique
@@ -1798,7 +1894,7 @@ void loop() {
         lastHeartbeat = millis();
         // Vérifier que la connexion est toujours active
         if (!mqtt.connected()) {
-          Serial.println("[MQTT] Connexion perdue, tentative de reconnexion...");
+          STEPLN("[MQTT] Connexion perdue, tentative de reconnexion...");
           mqttEnsureConnected();
         }
       }
@@ -1816,27 +1912,45 @@ void loop() {
   // ledBleUpdate() ne contrôle plus de pin séparé, les patterns sont combinés dans ledEnsureAtLeastOneOn()
   ledEnsureAtLeastOneOn(currentState, wifiOk, mqttOk, bleConnected);
 
+  // Priorité Internet: si on est en BLE/ELM/POLL et que le WiFi tombe, on revient à CONNECT_WIFI
+  // pour rétablir l'accès (et NTP) avant de reprendre le BLE.
+  if (!wifiOk && (currentState == CONNECT_BLE || currentState == INIT_ELM || currentState == POLL_SZ)) {
+    STEPLN("[FSM] Perte WiFi → priorité reconnexion internet (retour CONNECT_WIFI)");
+    if (currentState == POLL_SZ || currentState == INIT_ELM) {
+      bleConnected = false;
+      if (bleClient) {
+        bleClient->disconnect();
+        szDelay(100);
+      }
+    }
+    currentState = CONNECT_WIFI;
+    STEPLN("[FSM] État: CONNECT_WIFI");
+  }
+
   switch (currentState) {
     case BOOT:
       currentState = CONNECT_WIFI;
-      Serial.println("[FSM] État: CONNECT_WIFI");
+      STEPLN("[FSM] État: CONNECT_WIFI");
       break;
 
     case CONNECT_WIFI:
       if (wifiOk) {
-        Serial.printf("[FSM] WiFi connecté à: %s (IP: %s)\n", 
+        STEPF("[FSM] WiFi connecté à: %s (IP: %s)\n", 
                       WiFi.SSID().c_str(), 
                       WiFi.localIP().toString().c_str());
+        // Priorité 1: Internet + NTP pour traces horodatées avant toute chose
+        configureNTP();
+        STEPLN("[FSM] NTP configuré (traces horodatées) → CONNECT_MQTT");
         currentState = CONNECT_MQTT;
-        Serial.println("[FSM] État: CONNECT_MQTT");
+        STEPLN("[FSM] État: CONNECT_MQTT");
       }
       break;
 
     case CONNECT_MQTT:
       if (mqttOk) {
-        Serial.println("[FSM] MQTT connecté");
+        STEPLN("[FSM] MQTT connecté");
         currentState = CONNECT_BLE;
-        Serial.println("[FSM] État: CONNECT_BLE");
+        STEPLN("[FSM] État: CONNECT_BLE");
       }
       break;
 
@@ -1844,25 +1958,25 @@ void loop() {
       if (millis() - lastBleAttemptMs > 5000) {
         lastBleAttemptMs = millis();
         if (!vLinkerAddressValid) {
-          Serial.println("[FSM] Scan BLE pour vLinker…");
+          STEPLN("[FSM] Scan BLE pour vLinker…");
           // Lister les 5 meilleurs devices BLE
           bleScanAndListTop5();
         } else {
-          Serial.printf("[FSM] Tentative de connexion BLE à %s…\n", vLinkerAddress.toString().c_str());
+          STEPF("[FSM] Tentative de connexion BLE à %s…\n", vLinkerAddress.toString().c_str());
         }
         if (bleConnectVlinker()) {
           bleConnected = true;
-          Serial.println("[FSM] BLE OK (write+notify trouvés)");
+          STEPLN("[FSM] BLE OK (write+notify trouvés)");
           if (mqttOk) {
           mqttPublishStatus("BLE OK");
           }
           currentState = INIT_ELM;
         } else {
           bleConnected = false;
-          Serial.println("[FSM] BLE KO (retry dans 5s)");
+          STEPLN("[FSM] BLE KO (retry dans 5s)");
           // Réinitialiser le flag pour forcer un nouveau scan au prochain essai
           if (!vLinkerAddressValid) {
-            delay(100); // Petit délai avant de réessayer
+            szDelay(100); // Petit délai avant de réessayer
           }
         }
       }
@@ -1870,38 +1984,43 @@ void loop() {
 
     case INIT_ELM:
       if (!bleClient || !bleClient->isConnected()) {
-        Serial.println("[FSM] INIT_ELM: BLE déconnecté, retour à CONNECT_BLE");
+        STEPLN("[FSM] INIT_ELM: BLE déconnecté, retour à CONNECT_BLE");
         bleConnected = false;
         vLinkerAddressValid = false; // Force un nouveau scan
         if (bleClient) {
           bleClient->disconnect();
-          delay(100);
+          szDelay(100);
         }
         lastBleAttemptMs = millis(); // Réinitialiser le timer
         currentState = CONNECT_BLE;
         break;
       }
-      Serial.println("[FSM] Init ELM like SZ Viewer…");
+#if USE_OBD2_PROTOCOL
+      STEPLN("[FSM] Init ELM OBD2 (Car Scanner style)…");
+      if (elmInitObd2()) {
+#else
+      STEPLN("[FSM] Init ELM like SZ Viewer…");
       if (elmInitLikeSzViewer()) {
+#endif
         if (mqttOk) {
           mqttPublishStatus("ELM init done");
         }
         currentState = POLL_SZ;
       } else {
-        Serial.println("[FSM] Échec init ELM, réessai dans 5s...");
-        delay(5000);
+        STEPLN("[FSM] Échec init ELM, réessai dans 5s...");
+        szDelay(5000);
         // Reste en INIT_ELM pour réessayer
       }
       break;
 
     case POLL_SZ:
       if (!bleClient || !bleClient->isConnected()) {
-        Serial.println("[FSM] POLL_SZ: BLE déconnecté, retour à CONNECT_BLE");
+        STEPLN("[FSM] POLL_SZ: BLE déconnecté, retour à CONNECT_BLE");
         bleConnected = false;
         vLinkerAddressValid = false; // Force un nouveau scan
         if (bleClient) {
           bleClient->disconnect();
-          delay(100);
+          szDelay(100);
         }
         lastBleAttemptMs = millis(); // Réinitialiser le timer
         currentState = CONNECT_BLE;
@@ -1909,10 +2028,12 @@ void loop() {
       }
       if (millis() - lastPollMs > 500) { // à ajuster selon charge bus
         lastPollMs = millis();
-        // Collecte continue (priorité: toujours collecter, même sans WiFi)
+#if USE_OBD2_PROTOCOL
+        if (!pollObd2AndCollect()) {
+#else
         if (!pollSzPagesAndCollect()) {
-          // NO DATA détecté → réinitialiser ELM
-          Serial.println("[FSM] NO DATA → retour à INIT_ELM");
+#endif
+          STEPLN("[FSM] NO DATA → retour à INIT_ELM");
           currentState = INIT_ELM;
         }
       }

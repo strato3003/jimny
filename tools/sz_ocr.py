@@ -59,15 +59,15 @@ def run(cmd: list[str]) -> str:
 def ocr_frame(
     frame_path: Path,
     *,
-    crop_w: int = 1100,
-    crop_h: int = 520,
+    crop_w: int = 1600,
+    crop_h: int = 600,
     crop_x: int = 0,
     crop_y: int = 280,
     contrast: float = 2.2,
     brightness: float = 0.05,
 ) -> str:
     """
-    Retourne le texte OCR pour la zone noire avec les 20 lignes.
+    Retourne le texte OCR pour la zone du tableau SZ Viewer (intégralité des 2 colonnes, 20 lignes).
     """
     with tempfile.TemporaryDirectory(prefix="szocr_") as td:
         out_png = Path(td) / "crop.png"
@@ -143,10 +143,12 @@ def extract_values(ocr_text: str) -> Dict[str, float]:
                         found[mapped[1]] = val
                         bar_seen += 1
                 elif label == "Engine":
-                    if ("°C" in unit or "C" in unit) and "engine_temp_c" not in found:
+                    # UI: "Engine" apparaît 2 fois (colonne droite), ligne 7 = temp, ligne 10 = rpm
+                    # 1ère occurrence → engine_temp_c, 2e → engine_rpm
+                    if engine_seen == 0:
                         found[mapped[0]] = val
                         engine_seen += 1
-                    elif "rpm" in unit and "engine_rpm" not in found:
+                    elif engine_seen == 1:
                         found[mapped[1]] = val
                         engine_seen += 1
                 else:

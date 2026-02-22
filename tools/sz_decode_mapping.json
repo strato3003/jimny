@@ -1,0 +1,162 @@
+{
+  "desired_idle_speed_rpm": {
+    "page": "21A0",
+    "offset": 44,
+    "mult": 0.06220588595295306,
+    "div": 1.0,
+    "add": 844.9560488396442,
+    "label": "linear"
+  },
+  "accelerator_pct": {
+    "page": "21A0",
+    "offset": 30,
+    "mult": 0.017175313731705624,
+    "div": 1.0,
+    "add": -0.9207522541483826,
+    "label": "linear"
+  },
+  "intake_c": {
+    "page": "21A0",
+    "offset": 4,
+    "mult": 0.0,
+    "div": 1.0,
+    "add": -50.0,
+    "label": "linear"
+  },
+  "battery_v": {
+    "page": "21A0",
+    "offset": 14,
+    "mult": 0.000783260588164224,
+    "div": 1.0,
+    "add": 3.1378227820522167,
+    "label": "linear"
+  },
+  "fuel_temp_c": {
+    "page": "21CD",
+    "offset": 6,
+    "mult": 0.003271430996435287,
+    "div": 1.0,
+    "add": 33.983492559271205,
+    "label": "linear"
+  },
+  "bar_pressure_kpa": {
+    "page": "21A0",
+    "offset": 6,
+    "mult": 0.0,
+    "div": 1.0,
+    "add": 102.5,
+    "label": "linear"
+  },
+  "bar_pressure_mmhg": {
+    "page": "21A0",
+    "offset": 12,
+    "mult": 0.0,
+    "div": 1.0,
+    "add": 768.813,
+    "label": "linear"
+  },
+  "abs_pressure_mbar": {
+    "page": "21A0",
+    "offset": 18,
+    "mult": 0.8764883301473901,
+    "div": 1.0,
+    "add": 125.86914025494707,
+    "label": "linear"
+  },
+  "air_flow_estimate_mgcp": {
+    "page": "21A2",
+    "offset": 16,
+    "mult": 0.19092495031443646,
+    "div": 1.0,
+    "add": 230.81208725192,
+    "label": "linear"
+  },
+  "air_flow_request_mgcp": {
+    "page": "21A0",
+    "offset": 22,
+    "mult": 1.1960259168227778,
+    "div": 1.0,
+    "add": -74.44171829109968,
+    "label": "linear"
+  },
+  "speed_kmh": {
+    "page": "21A0",
+    "offset": 24,
+    "mult": 0.0076758257804214565,
+    "div": 1.0,
+    "add": 0.5328163584628314,
+    "label": "linear"
+  },
+  "rail_pressure_bar": {
+    "page": "21A0",
+    "offset": 26,
+    "mult": 0.09610612095902707,
+    "div": 1.0,
+    "add": 22.245939586268832,
+    "label": "linear"
+  },
+  "rail_pressure_control_bar": {
+    "page": "21A0",
+    "offset": 28,
+    "mult": 0.09623894267952157,
+    "div": 1.0,
+    "add": 19.68475517680929,
+    "label": "linear"
+  },
+  "desired_egr_position_pct": {
+    "page": "21A0",
+    "offset": 38,
+    "mult": 0.0008243844243056267,
+    "div": 1.0,
+    "add": 10.452069310589199,
+    "label": "linear"
+  },
+  "gear_ratio": {
+    "page": "21A2",
+    "offset": 34,
+    "mult": 0.3103289625028755,
+    "div": 1.0,
+    "add": -1554.0225442834137,
+    "label": "linear"
+  },
+  "egr_position_pct": {
+    "page": "21A0",
+    "offset": 36,
+    "mult": 0.09544619466159861,
+    "div": 1.0,
+    "add": 26.493944429533997,
+    "label": "linear"
+  },
+  "engine_temp_c": {
+    "page": "21A2",
+    "offset": 24,
+    "mult": 0.07335171995784256,
+    "div": 1.0,
+    "add": -183.22408684236524,
+    "label": "linear"
+  },
+  "air_temp_c": {
+    "page": "21A2",
+    "offset": 20,
+    "mult": 0.09561560498782616,
+    "div": 1.0,
+    "add": -260.3825049781947,
+    "label": "linear"
+  },
+  "requested_in_pressure_mbar": {
+    "page": "21A5",
+    "offset": 54,
+    "mult": 0.9641992329478984,
+    "div": 1.0,
+    "add": 1033.9141259340229,
+    "label": "linear"
+  },
+  "engine_rpm": {
+    "page": "21A0",
+    "offset": 34,
+    "mult": 2.2884172135642378,
+    "div": 1.0,
+    "add": -1186.340664743358,
+    "label": "linear"
+  }
+}

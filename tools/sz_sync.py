@@ -17,6 +17,20 @@ Pourquoi un point d'ancrage?
  - On demande donc à l'utilisateur la correspondance:
      frame_00001.png == 17:36:53
    ensuite on propage sur les frames suivantes.
+
+Attention — alignement raw / OCR:
+ 1) Plusieurs frames par seconde: avec fps=2 (ou 3), plusieurs PNG sont
+    associés à la MÊME seconde log (log_hhmmss). On leur attribue donc le
+    MÊME bloc raw (21A0/21A2/21A5/21CD). Résultat: pour une même seconde,
+    on compare les MÊMES valeurs décodées à 2 ou 3 OCR différents (écran
+    à t, t+0.5s, t+1s). Au plus une frame par seconde peut être alignée;
+    les autres biaisent la MAE. Utiliser tools/sz_jsonl_one_per_second.py
+    pour produire un jsonl "une ligne par seconde" (une frame représentative)
+    avant d'optimiser le décodeur.
+ 2) Raw par seconde: parse_trames() range les trames par seconde (HH:MM:SS).
+    Chaque page (21A0, 21A2, …) est stockée sous la seconde où la commande
+    SUIVANTE a été envoyée (flush). Donc les 4 pages d'une même seconde
+    peuvent provenir de 4 moments légèrement différents.
 """
 
 from __future__ import annotations

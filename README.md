@@ -10,6 +10,10 @@
 - **Protocole**: KWP2000 (Keyword Protocol 2000) - PIDs propriétaires
 - **PIDs utilisés**: 21A0, 21A2, 21A5, 21CD (PIDs étendus/propriétaires)
 
+### Alternative : OBD2 (comme Car Scanner)
+
+Car Scanner lit très bien les données K9K via le vLinker en **OBD2**. Utiliser ce protocole côté ESP32 est en général **plus simple** (PIDs documentés, pas de reverse-engineering). Voir [docs/OBD2_ALTERNATIVE.md](docs/OBD2_ALTERNATIVE.md) pour la démarche et les étapes (lister les PIDs Car Scanner → mapping → mode OBD2 sur l’ESP32).
+
 ## prompts agent
 ```
 proposes moi un code pour esp32 en t'inspirant de @esp32/vlinker-gw.ino , capable d'envoyer une sequence json sur mqtt qui reprend l'ensemble des 20 donnees affichees sur la fenetre en noir du programme "SZ Viewer" montré sur cette image attachee et qui proviennent du dialogue entamé entre le SZ Viewer et le vLinker (boitier OBD en Bluetooth) et capturé en MIM via un prog python.
@@ -39,6 +43,13 @@ python3 tools/sz_sync.py --anchor-hhmmss 17:36:53 --fps 2
 ### Étape suivante (décodage)
 
 Remplir progressivement `values` (manuellement ou via OCR) puis en déduire les offsets/échelles à implémenter dans `esp32/sz-mqtt.ino` (`decodeSzFromPages()`).
+
+### Capture pour MAE nulle (décodé = OCR)
+
+Avec un log à la seconde et plusieurs frames par seconde, une même trame est réutilisée pour plusieurs images → la MAE ne peut pas être nulle partout. Pour viser **MAE = 0** :
+
+- **MIM à la milliseconde** : utiliser le sniffer avec timestamps `[HH:MM:SS.mmm]` (ex. `recording/jimny_sniffer_ms.py` + `jimny_capture.log`), puis la synchro **sz_sync_ms** qui associe à chaque frame les dernières trames reçues à cet instant. Voir [recording/README.md](recording/README.md).
+- **Spécification générale** : [docs/CAPTURE_SZ_ZERO_MAE.md](docs/CAPTURE_SZ_ZERO_MAE.md).
 
 ## Système de LEDs expressif
 

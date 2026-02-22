@@ -1,0 +1,104 @@
+// Généré par tools/sz_decode_from_ocr_jsonl.py à partir de sz_sync_ocr.jsonl
+// Coller le contenu de decodeSzFromPages (remplacer l’existant) ou appliquer manuellement.
+
+  // desired_idle_speed_rpm (mae=7.71 n=510)
+  if (a0Len > 45) {
+    uint16_t raw = (a0[44] << 8) | a0[45];
+    out.desired_idle_speed_rpm = (float)raw * 0.06220588595295306f + 844.9560488396442f;
+  }
+
+  // accelerator_pct (mae=2.61 n=510)
+  if (a2Len > 5) {
+    uint16_t raw = (a2[4] << 8) | a2[5];
+    out.accelerator_pct = (float)raw * 0.26064220780047914f + -16.498404044868188f;
+  }
+
+  // intake_c (mae=0.00 n=510)
+  if (a0Len > 5) {
+    uint16_t raw = (a0[4] << 8) | a0[5];
+    out.intake_c = (float)raw * 0.0f + -50.0f;
+  }
+
+  // battery_v (mae=0.03 n=510)
+  if (a2Len > 27) {
+    uint16_t raw = (a2[26] << 8) | a2[27];
+    out.battery_v = (float)raw * 0.040871480833465604f + -110.9969629393979f;
+  }
+
+  // fuel_temp_c (mae=0.01 n=510)
+  if (a0Len > 41) {
+    uint16_t raw = (a0[40] << 8) | a0[41];
+    out.fuel_temp_c = (float)raw * -0.049803335431089446f + 35.89450912523603f;
+  }
+
+  // bar_pressure_kpa (mae=0.00 n=510)
+  if (a0Len > 7) {
+    uint16_t raw = (a0[6] << 8) | a0[7];
+    out.bar_pressure_kpa = (float)raw * 0.0f + 102.5f;
+  }
+
+  // bar_pressure_mmhg (mae=0.00 n=510)
+  if (a0Len > 13) {
+    uint16_t raw = (a0[12] << 8) | a0[13];
+    out.bar_pressure_mmhg = (float)raw * 0.0f + 768.813f;
+  }
+
+  // abs_pressure_mbar (mae=2.87 n=510)
+  if (a0Len > 19) {
+    uint16_t raw = (a0[18] << 8) | a0[19];
+    out.abs_pressure_mbar = (float)raw;
+  }
+
+  // air_flow_estimate_mgcp (mae=5.32 n=509)
+  if (a0Len > 21) {
+    uint16_t raw = (a0[20] << 8) | a0[21];
+    out.air_flow_estimate_mgcp = (float)raw / 10f;
+  }
+
+  // speed_kmh (mae=0.78 n=510)
+  if (a0Len > 25) {
+    uint16_t raw = (a0[24] << 8) | a0[25];
+    out.speed_kmh = (float)raw * 0.0076758257804214565f + 0.5328163584628314f;
+  }
+
+  // rail_pressure_bar (mae=18.99 n=510)
+  if (a0Len > 27) {
+    uint16_t raw = (a0[26] << 8) | a0[27];
+    out.rail_pressure_bar = (float)raw / 10f;
+  }
+
+  // rail_pressure_control_bar (mae=0.01 n=400)
+  if (a0Len > 15) {
+    uint16_t raw = (a0[14] << 8) | a0[15];
+    out.rail_pressure_control_bar = (float)raw / 1000f;
+  }
+
+  // desired_egr_position_pct (mae=0.01 n=510)
+  if (a5Len > 7) {
+    uint16_t raw = (a5[6] << 8) | a5[7];
+    out.desired_egr_position_pct = (float)raw * -4.2779983956687014e-05f + 35.34682533998348f;
+  }
+
+  // egr_position_pct (mae=0.83 n=510)
+  if (a0Len > 37) {
+    uint16_t raw = (a0[36] << 8) | a0[37];
+    out.egr_position_pct = (float)raw * 0.09544619466159861f + 26.493944429533997f;
+  }
+
+  // engine_temp_c (mae=0.88 n=510)
+  if (a2Len > 25) {
+    uint16_t raw = (a2[24] << 8) | a2[25];
+    out.engine_temp_c = (float)raw * 0.07335171995784256f + -183.22408684236524f;
+  }
+
+  // air_temp_c (mae=0.04 n=510)
+  if (a2Len > 21) {
+    uint16_t raw = (a2[20] << 8) | a2[21];
+    out.air_temp_c = (float)raw * 0.09561560498782616f + -260.3825049781947f;
+  }
+
+  // engine_rpm (mae=inf n=0)
+  if (a2Len > 13) {
+    uint16_t raw = (a2[12] << 8) | a2[13];
+    out.engine_rpm = (float)raw * 8f;
+  }

@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body {
+            background: rgba(0, 0, 0, 0); /* Fond transparent pour OBS */
+            color: #00FF00;              /* Vert "Matrix" pour la lisibilité */
+            font-family: 'Courier New', Courier, monospace;
+            font-weight: bold;
+            margin: 0;
+            padding: 10px;               /* Petit espacement du bord */
+            overflow: hidden;
+        }
+        #clock {
+            font-size: 40px;
+            text-shadow: 2px 2px 2px #000; /* Ombre pour lire sur fond clair */
+        }
+    </style>
+</head>
+<body>
+    <div id="clock">00:00:00.000</div>
+
+    <script>
+        function update() {
+            const now = new Date();
+            const h = String(now.getHours()).padStart(2, '0');
+            const m = String(now.getMinutes()).padStart(2, '0');
+            const s = String(now.getSeconds()).padStart(2, '0');
+            const ms = String(now.getMilliseconds()).padStart(3, '0');
+            
+            document.getElementById('clock').textContent = `${h}:${m}:${s}.${ms}`;
+            
+            // Utilise le rafraîchissement natif de l'écran (60Hz+)
+            requestAnimationFrame(update);
+        }
+        update();
+    </script>
+</body>
+</html>

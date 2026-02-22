@@ -2,7 +2,67 @@
 
 Ce fichier documente toutes les features et améliorations ajoutées au projet, conformément aux règles de développement.
 
-## Version 0.4.4 (en cours)
+## Version 0.4.11
+
+### Corrections et améliorations
+
+1. **LED: rythme de clignotement accéléré, phase OFF courte**
+   - Périodes réduites et duty cycle augmenté (70–80 % ON) pour tous les patterns (WiFi, BLE, combiné, secours).
+   - Overlay BLE: burst 120 ms, cycle 20 ms ON / 10 ms OFF. Overlay MQTT: pulse 70 ms ON.
+
+## Version 0.4.10
+
+### Corrections et améliorations
+
+1. **Horodatage sur chaque JSON MQTT**
+   - Ajout de `datetime` (NTP si dispo, sinon `UPTIME: ...`) sur `jimny/szviewer/raw` et `jimny/dtc` (succès et “vide/erreur”).
+
+## Version 0.4.9
+
+### Corrections et améliorations
+
+1. **Priorité FSM: Internet (WiFi + NTP) avant BLE, suivi permanent du réseau**
+   - Ordre: 1) Internet (WiFi + NTP) pour traces horodatées, 2) MQTT, 3) BLE.
+   - NTP configuré dès que le WiFi est connecté, avant CONNECT_MQTT.
+   - Si le WiFi tombe en CONNECT_BLE/INIT_ELM/POLL_SZ → retour à CONNECT_WIFI pour rétablir l'accès.
+
+## Version 0.4.8
+
+### Corrections et améliorations
+
+1. **LED: clignotements d’activité (vLinker + MQTT) avec une seule LED**
+   - Flash court à chaque échange BLE/ELM (TX ou NOTIFY) pour visualiser l’activité vLinker.
+   - Flash/pulse à chaque publication MQTT (status, szviewer, dtc, raw).
+   - Conservation de la règle “toujours une LED active quand l’ESP est alimenté” via pattern de base + secours.
+
+## Version 0.4.7
+
+### Corrections et améliorations
+
+1. **`speed_kmh` fiable via PID standard 010D**
+   - Lecture périodique de `010D` (OBD-II standard) et override de `speed_kmh` si valeur plausible (0–250 km/h).
+   - Évite les offsets propriétaires incertains (valeurs nulles/0 en roulage).
+2. **Ajout de `datetime` dans `jimny/szviewer`**
+   - Les JSON envoyés sur `jimny/szviewer` incluent maintenant `datetime` (NTP si dispo, sinon `UPTIME: ...`).
+
+## Version 0.4.6
+
+### Corrections et améliorations
+
+1. **engine_rpm : offset 14-15 et échelle 0.125**
+   - RPM lu aux octets 14-15. Échelle 0.125 (÷8) pour coller au régime réel ~1500–1800 tr/min.
+
+## Version 0.4.5
+
+### Corrections et améliorations
+
+1. **Flush MQTT après chaque publication**
+   - Plusieurs appels à `mqtt.loop()` + court délai après chaque `publish` pour que le paquet TCP soit bien envoyé avant de continuer (évite que les messages restent en buffer côté ESP32).
+   - Appliqué aux publications : `jimny/szviewer`, `jimny/szviewer/raw`, `jimny/status`, `jimny/dtc`.
+2. **Rappel des topics à la connexion MQTT**
+   - À la connexion au broker, log Serial : « Pour recevoir les messages: abonnez-vous à 'jimny/#' sur <broker>:<port> » pour vérifier broker et abonnement côté client.
+
+## Version 0.4.4
 
 ### Corrections et améliorations
 

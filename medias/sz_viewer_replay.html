@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SZ Viewer Replay — Jimny</title>
+  <style>
+    :root {
+      --bg: #0d0d0d;
+      --panel: #1a1a1a;
+      --border: #2a2a2a;
+      --text: #e0e0e0;
+      --accent: #4a9;
+      --muted: #666;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: "JetBrains Mono", "Consolas", "SF Mono", monospace;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 1rem;
+      min-height: 100vh;
+    }
+    h1 {
+      font-size: 1rem;
+      font-weight: 600;
+      color: var(--accent);
+      margin: 0 0 0.5rem 0;
+    }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.75rem;
+      margin-bottom: 1rem;
+    }
+    .toolbar label, .toolbar span { color: var(--muted); font-size: 0.85rem; }
+    .toolbar input[type="file"] { margin-right: 0.5rem; }
+    .toolbar button {
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--border);
+      padding: 0.4rem 0.8rem;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 0.85rem;
+    }
+    .toolbar button:hover { border-color: var(--accent); color: var(--accent); }
+    .toolbar button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .toolbar select {
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--border);
+      padding: 0.35rem 0.5rem;
+      font-family: inherit;
+      font-size: 0.85rem;
+    }
+    .progress-wrap {
+      flex: 1;
+      min-width: 120px;
+      max-width: 320px;
+    }
+    .progress-wrap input[type="range"] {
+      width: 100%;
+      margin: 0;
+      accent-color: var(--accent);
+    }
+    .viewer {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 1rem 1.25rem;
+      max-width: 520px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.35rem 2rem;
+    }
+    .viewer .row {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 1rem;
+    }
+    .viewer .label {
+      color: var(--muted);
+      font-size: 0.75rem;
+    }
+    .viewer .value {
+      font-size: 0.95rem;
+      min-width: 4.5ch;
+      text-align: right;
+    }
+    .viewer .value.null { color: #444; }
+    .meta {
+      margin-top: 0.75rem;
+      font-size: 0.75rem;
+      color: var(--muted);
+    }
+    .status { color: var(--muted); font-size: 0.8rem; }
+    .dropzone { border: 1px dashed var(--border); border-radius: 4px; padding: 0.5rem; }
+    .dropzone.dragover { border-color: var(--accent); background: rgba(68,170,153,0.08); }
+    .main { display: flex; flex-wrap: wrap; gap: 1.5rem; align-items: flex-start; }
+    .clock-box {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.75rem;
+    }
+    .clock-box h2 { font-size: 0.8rem; color: var(--muted); margin: 0; font-weight: 500; }
+    .clock-wrap { position: relative; }
+    .clock-svg { display: block; }
+    .clock-btn { margin: 0 0.25rem; }
+  </style>
+</head>
+<body>
+  <h1>SZ Viewer Replay</h1>
+  <div class="toolbar dropzone" id="dropzone">
+    <input type="file" id="file" accept=".json,application/json" />
+    <button type="button" id="play" disabled>Play</button>
+    <button type="button" id="restart" disabled>Restart</button>
+    <label for="speed">Vitesse</label>
+    <select id="speed">
+      <option value="1">1×</option>
+      <option value="2" selected>2×</option>
+      <option value="3">3×</option>
+    </select>
+    <div class="progress-wrap">
+      <input type="range" id="seek" min="0" max="100" value="0" step="0.01" />
+    </div>
+    <span class="status" id="status">Charger un JSON (NDJSON)</span>
+  </div>
+  <div class="main">
+  <div class="viewer" id="viewer" style="visibility: hidden;">
+    <div class="row"><span class="label">Desired idle speed (rpm)</span><span class="value" id="v-desired_idle_speed_rpm">—</span></div>
+    <div class="row"><span class="label">Accelerator (%)</span><span class="value" id="v-accelerator_pct">—</span></div>
+    <div class="row"><span class="label">Intake (°C)</span><span class="value" id="v-intake_c">—</span></div>
+    <div class="row"><span class="label">Battery (V)</span><span class="value" id="v-battery_v">—</span></div>
+    <div class="row"><span class="label">Fuel temp (°C)</span><span class="value" id="v-fuel_temp_c">—</span></div>
+    <div class="row"><span class="label">Bar pressure (kPa)</span><span class="value" id="v-bar_pressure_kpa">—</span></div>
+    <div class="row"><span class="label">Bar pressure (mmHg)</span><span class="value" id="v-bar_pressure_mmhg">—</span></div>
+    <div class="row"><span class="label">Abs pressure (mbar)</span><span class="value" id="v-abs_pressure_mbar">—</span></div>
+    <div class="row"><span class="label">Air flow estimate (mg/cp)</span><span class="value" id="v-air_flow_estimate_mgcp">—</span></div>
+    <div class="row"><span class="label">Air flow request (mg/cp)</span><span class="value" id="v-air_flow_request_mgcp">—</span></div>
+    <div class="row"><span class="label">Speed (km/h)</span><span class="value" id="v-speed_kmh">—</span></div>
+    <div class="row"><span class="label">Rail pressure (bar)</span><span class="value" id="v-rail_pressure_bar">—</span></div>
+    <div class="row"><span class="label">Rail pressure ctrl (bar)</span><span class="value" id="v-rail_pressure_control_bar">—</span></div>
+    <div class="row"><span class="label">Desired EGR (%)</span><span class="value" id="v-desired_egr_position_pct">—</span></div>
+    <div class="row"><span class="label">Gear ratio</span><span class="value" id="v-gear_ratio">—</span></div>
+    <div class="row"><span class="label">EGR position (%)</span><span class="value" id="v-egr_position_pct">—</span></div>
+    <div class="row"><span class="label">Engine temp (°C)</span><span class="value" id="v-engine_temp_c">—</span></div>
+    <div class="row"><span class="label">Air temp (°C)</span><span class="value" id="v-air_temp_c">—</span></div>
+    <div class="row"><span class="label">Requested in pressure (mbar)</span><span class="value" id="v-requested_in_pressure_mbar">—</span></div>
+    <div class="row"><span class="label">Engine RPM</span><span class="value" id="v-engine_rpm">—</span></div>
+  </div>
+  <div class="clock-box" id="clockBox" style="visibility: hidden;">
+    <h2 id="clockTitle">Heure replay</h2>
+    <div class="clock-wrap">
+      <svg id="clockSvg" class="clock-svg" width="160" height="160" viewBox="0 0 160 160">
+        <circle cx="80" cy="80" r="76" fill="none" stroke="var(--border)" stroke-width="2"/>
+        <circle cx="80" cy="80" r="4" fill="var(--accent)"/>
+        <!-- 12, 3, 6, 9 -->
+        <line x1="80" y1="12" x2="80" y2="20" stroke="var(--text)" stroke-width="2"/>
+        <line x1="140" y1="80" x2="132" y2="80" stroke="var(--text)" stroke-width="2"/>
+        <line x1="80" y1="148" x2="80" y2="140" stroke="var(--text)" stroke-width="2"/>
+        <line x1="20" y1="80" x2="28" y2="80" stroke="var(--text)" stroke-width="2"/>
+        <!-- Heure (aiguille courte) -->
+        <line id="handHour" x1="80" y1="80" x2="80" y2="44" stroke="var(--accent)" stroke-width="4" stroke-linecap="round"/>
+        <!-- Minute -->
+        <line id="handMin" x1="80" y1="80" x2="80" y2="28" stroke="var(--text)" stroke-width="2.5" stroke-linecap="round"/>
+        <!-- Seconde -->
+        <line id="handSec" x1="80" y1="80" x2="80" y2="22" stroke="var(--muted)" stroke-width="1" stroke-linecap="round"/>
+      </svg>
+    </div>
+    <div>
+      <button type="button" id="clockBack" class="clock-btn" disabled>◀ Reculer</button>
+      <button type="button" id="clockFwd" class="clock-btn" disabled>▶ Avancer</button>
+    </div>
+    <span class="status" id="clockTime">--:--:--</span>
+  </div>
+  </div>
+  <div class="meta" id="meta"></div>
+
+  <script>
+    const FIELDS = [
+      'desired_idle_speed_rpm', 'accelerator_pct', 'intake_c', 'battery_v', 'fuel_temp_c',
+      'bar_pressure_kpa', 'bar_pressure_mmhg', 'abs_pressure_mbar', 'air_flow_estimate_mgcp', 'air_flow_request_mgcp',
+      'speed_kmh', 'rail_pressure_bar', 'rail_pressure_control_bar', 'desired_egr_position_pct', 'gear_ratio',
+      'egr_position_pct', 'engine_temp_c', 'air_temp_c', 'requested_in_pressure_mbar', 'engine_rpm'
+    ];
+
+    let frames = [];
+    let index = 0;
+    let playing = false;
+    let nextAt = 0;
+    let raf = null;
+
+    const fileEl = document.getElementById('file');
+    const playBtn = document.getElementById('play');
+    const restartBtn = document.getElementById('restart');
+    const speedEl = document.getElementById('speed');
+    const seekEl = document.getElementById('seek');
+    const statusEl = document.getElementById('status');
+    const viewerEl = document.getElementById('viewer');
+    const metaEl = document.getElementById('meta');
+
+    const PCT_FIELDS = ['accelerator_pct', 'desired_egr_position_pct', 'egr_position_pct'];
+    let lastDisplayValues = {};
+
+    function fmt(v, opts) {
+      if (opts && opts.percent) {
+        if (v == null || (typeof v === 'number' && isNaN(v))) return null;
+        const n = typeof v === 'number' ? v : parseFloat(v);
+        if (Number.isNaN(n)) return null;
+        const clamped = Math.max(0, Math.min(100, Math.round(n)));
+        return clamped + ' %';
+      }
+      if (v == null || (typeof v === 'number' && isNaN(v))) return null;
+      if (typeof v === 'number') return String(Math.round(v));
+      return String(v);
+    }
+
+    function setValues(obj) {
+      FIELDS.forEach(f => {
+        const el = document.getElementById('v-' + f);
+        if (!el) return;
+        let v = obj[f];
+        let text = null;
+        if (PCT_FIELDS.includes(f)) {
+          text = fmt(v, { percent: true });
+        } else {
+          text = fmt(v);
+        }
+        if (text != null) {
+          lastDisplayValues[f] = text;
+          el.textContent = text;
+          el.classList.remove('null');
+        } else if (lastDisplayValues[f] != null) {
+          el.textContent = lastDisplayValues[f];
+          el.classList.add('null');
+        }
+      });
+    }
+
+    function parseDateTime(s) {
+      if (!s || typeof s !== 'string') return null;
+      const m = s.match(/^\d{4}-\d{2}-\d{2}\s+(\d{1,2}):(\d{2}):(\d{2})/);
+      if (!m) return null;
+      return { h: parseInt(m[1], 10), m: parseInt(m[2], 10), s: parseInt(m[3], 10) };
+    }
+
+    function updateClock(obj) {
+      const t = parseDateTime(obj && obj.datetime);
+      const handHour = document.getElementById('handHour');
+      const handMin = document.getElementById('handMin');
+      const handSec = document.getElementById('handSec');
+      const clockTime = document.getElementById('clockTime');
+      if (!t) {
+        clockTime.textContent = '--:--:--';
+        handHour.setAttribute('transform', 'rotate(0 80 80)');
+        handMin.setAttribute('transform', 'rotate(0 80 80)');
+        handSec.setAttribute('transform', 'rotate(0 80 80)');
+        return;
+      }
+      const degH = (t.h % 12) * 30 + t.m * 0.5 + t.s / 120;
+      const degM = t.m * 6 + t.s * 0.1;
+      const degS = t.s * 6;
+      handHour.setAttribute('transform', `rotate(${degH} 80 80)`);
+      handMin.setAttribute('transform', `rotate(${degM} 80 80)`);
+      handSec.setAttribute('transform', `rotate(${degS} 80 80)`);
+      clockTime.textContent = [t.h, t.m, t.s].map(x => String(x).padStart(2, '0')).join(':');
+    }
+
+    function seekByDelta(deltaMs) {
+      if (frames.length === 0) return;
+      const t0 = frames[0].ts_ms;
+      const endMs = frames[frames.length - 1].ts_ms - t0;
+      const currentMs = frames[index].ts_ms - t0;
+      const targetMs = Math.max(0, Math.min(endMs, currentMs + deltaMs));
+      let i = deltaMs >= 0 ? frames.length - 1 : 0;
+      if (deltaMs >= 0) {
+        for (let k = 0; k < frames.length; k++) {
+          if ((frames[k].ts_ms - t0) >= targetMs) { i = k; break; }
+        }
+      } else {
+        for (let k = frames.length - 1; k >= 0; k--) {
+          if ((frames[k].ts_ms - t0) <= targetMs) { i = k; break; }
+        }
+      }
+      if (playing) { playing = false; playBtn.textContent = 'Play'; if (raf) cancelAnimationFrame(raf); raf = null; }
+      showFrame(i);
+    }
+
+    function showFrame(i) {
+      if (i < 0 || i >= frames.length) return;
+      index = i;
+      setValues(frames[i]);
+      updateClock(frames[i]);
+      const t0 = frames[0].ts_ms;
+      const t1 = frames[frames.length - 1].ts_ms;
+      const p = t1 > t0 ? ((frames[i].ts_ms - t0) / (t1 - t0)) * 100 : 0;
+      seekEl.value = p;
+      const d = frames[i].datetime || '';
+      metaEl.textContent = `Frame ${i + 1} / ${frames.length} · ${d} · ts_ms: ${frames[i].ts_ms}`;
+    }
+
+    function tick() {
+      if (!playing || index >= frames.length - 1) {
+        if (index >= frames.length - 1) playing = false;
+        playBtn.textContent = 'Play';
+        return;
+      }
+      const now = performance.now();
+      if (now < nextAt) {
+        raf = requestAnimationFrame(tick);
+        return;
+      }
+      index++;
+      showFrame(index);
+      if (index >= frames.length - 1) {
+        playing = false;
+        playBtn.textContent = 'Play';
+        return;
+      }
+      const delay = (frames[index].ts_ms - frames[index - 1].ts_ms) / parseInt(speedEl.value, 10);
+      nextAt = now + Math.max(0, delay);
+      raf = requestAnimationFrame(tick);
+    }
+
+    function playPause() {
+      if (frames.length === 0) return;
+      playing = !playing;
+      playBtn.textContent = playing ? 'Pause' : 'Play';
+      if (playing) {
+        nextAt = performance.now();
+        if (index >= frames.length - 1) index = -1;
+        raf = requestAnimationFrame(tick);
+      } else if (raf) {
+        cancelAnimationFrame(raf);
+        raf = null;
+      }
+    }
+
+    function restart() {
+      if (raf) cancelAnimationFrame(raf);
+      raf = null;
+      playing = false;
+      playBtn.textContent = 'Play';
+      showFrame(0);
+    }
+
+    function loadLines(text) {
+      const lines = text.trim().split('\n').filter(l => l.trim());
+      frames = lines.map(l => {
+        try { return JSON.parse(l); } catch (e) { return null; }
+      }).filter(Boolean);
+      if (frames.length === 0) {
+        statusEl.textContent = 'Aucune trame valide.';
+        viewerEl.style.visibility = 'hidden';
+        return;
+      }
+      seekEl.max = 100;
+      seekEl.value = 0;
+      index = 0;
+      lastDisplayValues = {};
+      showFrame(0);
+      viewerEl.style.visibility = 'visible';
+      document.getElementById('clockBox').style.visibility = 'visible';
+      playBtn.disabled = false;
+      restartBtn.disabled = false;
+      document.getElementById('clockBack').disabled = false;
+      document.getElementById('clockFwd').disabled = false;
+      const t0 = frames[0].ts_ms;
+      const t1 = frames[frames.length - 1].ts_ms;
+      const durSec = ((t1 - t0) / 1000).toFixed(1);
+      statusEl.textContent = `${frames.length} trames · ${durSec} s · Replay prêt (vitesse ${speedEl.value}×).`;
+    }
+
+    fileEl.addEventListener('change', () => {
+      const f = fileEl.files[0];
+      if (!f) return;
+      statusEl.textContent = 'Chargement…';
+      const r = new FileReader();
+      r.onload = () => { loadLines(r.result); };
+      r.readAsText(f, 'UTF-8');
+    });
+
+    playBtn.addEventListener('click', playPause);
+    restartBtn.addEventListener('click', restart);
+
+    document.getElementById('clockBack').addEventListener('click', () => seekByDelta(-5000));
+
+    let holdFwdTimer = null;
+    let holdFwdStep = 0;
+    function stopHoldFwd() {
+      if (holdFwdTimer) clearInterval(holdFwdTimer);
+      holdFwdTimer = null;
+      holdFwdStep = 0;
+    }
+    document.getElementById('clockFwd').addEventListener('mousedown', () => {
+      if (frames.length === 0) return;
+      holdFwdStep = 0;
+      const run = () => {
+        holdFwdStep++;
+        const delta = 5000 + Math.min(25000, holdFwdStep * 1500);
+        seekByDelta(delta);
+        if (index >= frames.length - 1) stopHoldFwd();
+        else {
+          const nextInterval = holdFwdStep <= 4 ? 350 : holdFwdStep <= 10 ? 200 : holdFwdStep <= 20 ? 110 : 60;
+          clearInterval(holdFwdTimer);
+          holdFwdTimer = setInterval(run, nextInterval);
+        }
+      };
+      run();
+      holdFwdTimer = setInterval(run, holdFwdStep <= 4 ? 350 : 200);
+    });
+    document.getElementById('clockFwd').addEventListener('mouseleave', stopHoldFwd);
+    document.getElementById('clockFwd').addEventListener('mouseup', stopHoldFwd);
+
+    let holdBackTimer = null;
+    let holdBackStep = 0;
+    function stopHoldBack() {
+      if (holdBackTimer) clearInterval(holdBackTimer);
+      holdBackTimer = null;
+      holdBackStep = 0;
+    }
+    document.getElementById('clockBack').addEventListener('mousedown', () => {
+      if (frames.length === 0) return;
+      holdBackStep = 0;
+      const run = () => {
+        holdBackStep++;
+        const delta = -(5000 + Math.min(25000, holdBackStep * 1500));
+        seekByDelta(delta);
+        if (index <= 0) stopHoldBack();
+        else {
+          const nextInterval = holdBackStep <= 4 ? 350 : holdBackStep <= 10 ? 200 : holdBackStep <= 20 ? 110 : 60;
+          clearInterval(holdBackTimer);
+          holdBackTimer = setInterval(run, nextInterval);
+        }
+      };
+      run();
+      holdBackTimer = setInterval(run, holdBackStep <= 4 ? 350 : 200);
+    });
+    document.getElementById('clockBack').addEventListener('mouseleave', stopHoldBack);
+    document.getElementById('clockBack').addEventListener('mouseup', stopHoldBack);
+
+    seekEl.addEventListener('input', () => {
+      if (frames.length === 0) return;
+      const p = parseFloat(seekEl.value, 10) / 100;
+      const i = Math.min(frames.length - 1, Math.floor(p * frames.length));
+      if (playing) { playing = false; playBtn.textContent = 'Play'; if (raf) cancelAnimationFrame(raf); raf = null; }
+      showFrame(i);
+    });
+
+    const dropzone = document.getElementById('dropzone');
+    dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
+    dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+    dropzone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropzone.classList.remove('dragover');
+      const f = e.dataTransfer.files[0];
+      if (f && (f.name.endsWith('.json') || f.type === 'application/json')) {
+        statusEl.textContent = 'Chargement…';
+        f.text().then(loadLines);
+      }
+    });
+
+    // Charger le dernier JSON si la page est servie depuis medias/ (même origine)
+    const defaultPath = 'jimny-2026-02-19-decheterrie-jard.json';
+    fetch(defaultPath).then(r => {
+      if (r.ok) return r.text();
+      throw new Error('not found');
+    }).then(loadLines).catch(() => {
+      statusEl.textContent = 'Charger un fichier JSON (NDJSON) ou glisser ici.';
+    });
+  </script>
+</body>
+</html>
