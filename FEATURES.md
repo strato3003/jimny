@@ -2,6 +2,10 @@
 
 Ce fichier documente toutes les features et améliorations ajoutées au projet, conformément aux règles de développement.
 
+## Version 0.5.1 (non encore testée)
+
+- Ajout du **protocole OBD2** (PIDs mode 01, style Car Scanner) en plus du protocole SZ. Défini par `USE_OBD2_PROTOCOL 1` (défaut). Fichiers : `obd2_decode.h`, docs `OBD2_ALTERNATIVE.md` et `OBD2_PIDS_K9K.md`. **À valider sur véhicule.**
+
 ## Version 0.4.11
 
 ### Corrections et améliorations

@@ -10,6 +10,8 @@ medias/ocr/
 # medias/trames.log
 # medias/sz_sync.jsonl
 # medias/sz_sync_ocr.jsonl
+# Vidéos (limite GitHub 100 Mo)
+recording/*.mp4
 recording/2026-02-21_17-50-47_frames/frame_00001.png
 recording/2026-02-21_17-50-47_frames/frame_00002.png
 recording/2026-02-21_17-50-47_frames/frame_00003.png

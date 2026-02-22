@@ -52,7 +52,7 @@ struct LedPattern {
 
 // --- Configuration (WiFi/MQTT/BLE) ---
 static const char* app_name = "SZ→MQTT Gateway";
-static const char* version  = "0.4.13";
+static const char* version  = "0.5.1";
 
 WiFiMulti wifiMulti;
 static const char* mqtt_server = "srv.lpb.ovh";
